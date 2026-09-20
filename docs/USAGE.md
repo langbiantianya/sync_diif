@@ -27,13 +27,13 @@ Gradle 多模块，依赖方向单向 `app → checks → core`：
 | 模块 | 职责 | 源码目录 |
 |:---|:---|:---|
 | `core` | 对账内核：`Row` / `DiffEngine` / `Connector` / `FieldRules` / `Reporter` / 配置工厂 | `core/src/main/kotlin` |
-| `checks` | `Check` 抽象与注册表 + 具体对账（`OrderSyncCheck`） | `checks/src/main/java` |
-| `app` | CLI 入口 + Shadow Fat JAR | `app/src/main/java` |
+| `checks` | `Check` 抽象与注册表 + 具体对账（`OrderSyncCheck`） | `checks/src/main/kotlin` |
+| `app` | CLI 入口 + Shadow Fat JAR | `app/src/main/kotlin` |
 
 改代码前先对号入座：新增**数据源**动 `core`，新增**一条对账**动 `checks`，
 改**命令行**动 `app`。细节见 [README §16](../README.md#16-目录)。
 
-> `checks` / `app` 的 Kotlin 源码放在 `src/main/java` 下（Kotlin 插件同样编译该目录），
+> `checks` / `app` 的 Kotlin 源码放在 `src/main/kotlin` 下（Kotlin 插件同样编译该目录），
 > `core` 用的是 `src/main/kotlin`。跟随所在模块现有约定即可。
 
 ### 环境要求
@@ -266,7 +266,7 @@ java -jar app/build/libs/sync_diff-all.jar --check user_sync --registry conf/che
 **方式二：加进内置注册**（改代码，注解扫描）
 
 ```kotlin
-// checks/src/main/java/com/kxxnzstdsw/sync_diff/checks/UserSyncCheck.kt
+// checks/src/main/kotlin/com/kxxnzstdsw/sync_diff/checks/UserSyncCheck.kt
 @BuiltinCheck                    // 就这一行；不用在任何清单里登记
 object UserSyncCheck : CheckBase("user_sync") {
     override suspend fun Ctx.run() { /* ... */ }
@@ -278,7 +278,7 @@ object UserSyncCheck : CheckBase("user_sync") {
 执行顺序 = `@BuiltinCheck(order = ...)` 升序（默认 `0`）、同 order 按类名字典序，
 可用 `@BuiltinCheck(order = -10)` 把某个 Check 提到前面。
 
-你自己的 Check 放在 `checks` 模块里（`checks/src/main/java/com/kxxnzstdsw/sync_diff/checks/`，
+你自己的 Check 放在 `checks` 模块里（`checks/src/main/kotlin/com/kxxnzstdsw/sync_diff/checks/`，
 **包必须一致**，否则扫不到），并在 `checks/build.gradle.kts` 里补上它需要的依赖；
 只要 `app` 依赖 `checks`，无需改 `app`。注解形式必须是 Kotlin `object`——`class` 声明没有
 单例实例，扫描到会在启动期直接报错，这种情况请用方式一显式注册。
@@ -521,8 +521,7 @@ class PostgresConnector(dsn: String, private val fetchSize: Int = 10_000) : Conn
    prepare/execute 发生在迭代时，异常会绕过它。
 
 以上文件放在 `core` 模块：
-`core/src/main/kotlin/com/kxxnzstdsw/sync_diff/connectors/PostgresConnector.kt`
-（`core` 用的是 `src/main/kotlin`，别和 `checks` / `app` 的 `src/main/java` 混了）。
+`core/src/main/kotlin/com/kxxnzstdsw/sync_diff/connectors/PostgresConnector.kt`。
 
 **2) 加工厂方法**
 
@@ -854,7 +853,7 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 | `Gradle requires JVM 17 or later to run` | 构建 JVM 是 JDK 8 | `export JAVA_HOME=/path/to/jdk-17`，或在 `gradle.properties` 设 `org.gradle.java.home` |
 | `找不到或无法加载主类 com.kxxnzstdsw.sync_diff.MainKt` | `Main.kt` 的 `package` 与 `app/build.gradle.kts` 里 `Main-Class` 不一致（Kotlin 按 package 生成类名，不看目录） | 两处包名对齐；当前都是 `com.kxxnzstdsw.sync_diff` |
 | `java -jar build/libs/...` 报文件不存在 | fat jar 在 `app` 模块 | 用 `app/build/libs/sync_diff-all.jar` |
-| 自己写的 Check 编译不过 / CLI 里找不到 | Check 放错模块或缺依赖 | Check 放 `checks` 模块（`src/main/java`），依赖加在 `checks/build.gradle.kts`；再按 §3.4 注册 |
+| 自己写的 Check 编译不过 / CLI 里找不到 | Check 放错模块或缺依赖 | Check 放 `checks` 模块，依赖加在 `checks/build.gradle.kts`；再按 §3.4 注册 |
 | 改了 `core` 但 `checks` 没生效 | 依赖方向是 `app → checks → core` | 确认 `checks`/`app` 有 `implementation(project(":core"))`；改完跑 `./gradlew build` |
 
 ---
