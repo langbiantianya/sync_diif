@@ -1,8 +1,6 @@
 package com.kxxnzstdsw.sync_diff.check
 
 import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck
-import com.kxxnzstdsw.sync_diff.checks.WilsonActivityApplyDetailCheck
-import com.kxxnzstdsw.sync_diff.checks.WilsonActivityEventHeaderCheck
 import org.junit.jupiter.api.BeforeEach
 import java.io.File
 import java.nio.file.Files
@@ -129,13 +127,9 @@ class CheckRegistryTest {
         assertEquals(
             listOf(
                 OrderSyncCheck.name,
-                WilsonActivityApplyDetailCheck.name,
-                WilsonActivityEventHeaderCheck.name,
             ),
             reg.all().map { it.name },
         )
         assertSame(OrderSyncCheck, reg[OrderSyncCheck.name])
-        assertSame(WilsonActivityApplyDetailCheck, reg[WilsonActivityApplyDetailCheck.name])
-        assertSame(WilsonActivityEventHeaderCheck, reg[WilsonActivityEventHeaderCheck.name])
     }
 }
