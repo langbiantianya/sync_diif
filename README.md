@@ -25,16 +25,18 @@ flowchart TD
     Check["Check (Kotlin 对象)<br/>自己持有上下游 Connector 与配置"]
     Parquet["ParquetConnector<br/>(DuckDB)"]
     Impala["ImpalaConnector<br/>(Hive JDBC)"]
-    Future["PG / MySQL / MSSQL / MC / …<br/>(阶段 2+ 按需)"]
+    DuckDBFile["DuckDB 文件连接器<br/>(Parquet/CSV/Excel/JSONL)"]
+    Jdbc["JDBC 连接器<br/>(PG/MySQL/MSSQL/CH/MC)"]
+    Future["…<br/>(按需新增)"]
     Engine["DiffEngine"]
     Report["Reporter<br/>(Markdown + Webhook)"]
 
-    Check --> Parquet
+    Check --> DuckDBFile
+    Check --> Jdbc
     Check --> Impala
-    Check --> Future
-    Parquet --> Engine
+    DuckDBFile --> Engine
+    Jdbc --> Engine
     Impala --> Engine
-    Future --> Engine
     Engine --> Report
 ```
 
@@ -407,7 +409,7 @@ inline infix fun <T> Iterable<T>.forEachParallel(crossinline block: suspend (T) 
 | `equals/hashCode/toString` 手写 | `data class` |
 | `switch (x) { case A: ...; default: }` | `when (x) { is A -> ...; else -> ... }` |
 
-## 5. 阶段 1：Parquet + Impala
+## 5. DuckDB 文件连接器（Parquet / CSV / Excel / JSONL）
 
 ### 5.1 ParquetConnector
 
@@ -452,18 +454,47 @@ class ParquetConnector(
 
 > 注：生产里 `sql` 参数须用参数化预编译或经白名单校验；演示 SQL 采用字符串拼接只为简洁。
 
-### 5.2 使用
+### 5.2 CsvConnector
+
+使用 DuckDB `read_csv_auto`，自动推断列类型。
 
 ```kotlin
-val src = ParquetConnector("/data/orders/dt=2026-09-01/part-0.parquet")
-val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))  // 生产：连 Impala
-val tgtLocal = ParquetConnector("/tmp/tgt.parquet")                    // 自测：直接读本地 parquet
-
-// 对象存储
-val srcS3 = ParquetConnector("s3://bucket/orders/dt=2026-09-01/part-0.parquet")
+CsvConnector("/data/orders/2026-09-01.csv").use { src ->
+    src.stream("SELECT * FROM read_csv_auto('$path')").take(1000).toList()
+}
 ```
 
-### 5.3 交付物与周期
+### 5.3 ExcelConnector
+
+使用 DuckDB `excel` 扩展读 `.xlsx`。
+
+```kotlin
+ExcelConnector("/data/orders/2026-09-01.xlsx").use { src ->
+    src.stream("SELECT * FROM st_read('$path')").take(1000).toList()
+}
+```
+
+### 5.4 JsonlConnector
+
+使用 DuckDB `read_jsonl`，每行一个 JSON 对象自动解析。
+
+```kotlin
+JsonlConnector("/data/orders/2026-09-01.jsonl").use { src ->
+    src.stream("SELECT * FROM read_jsonl('$path')").take(1000).toList()
+}
+```
+
+### 5.5 共享特性
+
+所有 DuckDB 文件连接器共用同一套构造模式：
+
+- `jdbc:duckdb:` in-process 引擎，构造期建连
+- `autoCommit = false`，显式事务持有会话配置
+- `memory_limit` / `temp_directory` 可配置
+- S3/OSS：`s3://` / `oss://` 路径自动 `INSTALL/LOAD httpfs`
+- `stream()` 服务端游标逐行 `yield`，JVM 堆只保留一行
+
+### 5.6 交付物与周期
 
 1 周。包含：
 
@@ -474,7 +505,7 @@ val srcS3 = ParquetConnector("s3://bucket/orders/dt=2026-09-01/part-0.parquet")
 - `Reporter`（Markdown + Webhook）
 - CLI（Clikt）
 
-### 5.4 验证点
+### 5.7 验证点
 
 - DuckDB 读大 Parquet 不 OOM（row group 流式 + spill）
 - Impala JDBC 连接稳定
@@ -482,35 +513,32 @@ val srcS3 = ParquetConnector("s3://bucket/orders/dt=2026-09-01/part-0.parquet")
 - 自定义规则 lambda 可扩展
 - 对象存储（S3/OSS）可读
 
-## 6. 阶段 2+：JDBC 源
+## 6. 已实现的连接器
 
-每个源只新增一个 `Connector` 类。关键差异在游标参数与类型归一。
+### 6.1 DuckDB 文件连接器
 
-| 阶段 | 源 | 关键参数 | 周期 | 陷阱 |
-|:---:|:---|:---|:---:|:---|
-| 2 | PostgreSQL | `autoCommit=false` + `fetchSize=10000` | 2-3 天 | 不关 autoCommit 会全量拉回 |
-| 3 | MySQL | `useCursorFetch=true` + `setFetchSize(Integer.MIN_VALUE)` | 2-3 天 | 流式期间连接不能复用 |
-| 4 | MSSQL | `responseBuffering=adaptive` | 2-3 天 | 默认全缓冲 |
-| 5 | MaxCompute | ODPS JDBC + Tunnel 分批 | 3-5 天 | Tunnel 单次 1 万行限制需放开，类型映射非标准 |
+共用同一个 `jdbc:duckdb:` in-process 引擎，读文件不额外占用 JVM 堆。
 
-PostgreSQL 示例：
+| 连接器 | DuckDB 函数 | 说明 |
+|:---|:---|:---|
+| `ParquetConnector` | `read_parquet` | Parquet 文件，row group 流式 |
+| `CsvConnector` | `read_csv_auto` | CSV / TSV，自动推断类型 |
+| `ExcelConnector` | `st_read`（excel 扩展） | `.xlsx`，需 `INSTALL/LOAD excel` |
+| `JsonlConnector` | `read_jsonl` | JSONL（每行一个 JSON 对象） |
 
-```kotlin
-class PostgresConnector(dsn: String, private val fetchSize: Int = 10_000) : Connector {
-    private val conn = DriverManager.getConnection(dsn).apply { autoCommit = false }
+S3/OSS：路径含 `s3://` / `oss://` 时自动 `INSTALL/LOAD httpfs`。
 
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs -> while (rs.next()) yield(rs.toRow()) }
-        }
-    }
+### 6.2 JDBC 连接器
 
-    override fun query(sql: String): List<Row> = stream(sql).toList()
-    override fun one(sql: String): Row? = stream("$sql LIMIT 1").firstOrNull()
-    override fun close() = conn.close()
-}
-```
+| 连接器 | JDBC URL 前缀 | 关键参数 | 陷阱 |
+|:---|:---|:---|:---|
+| `ImpalaConnector` | `jdbc:impala://` | `autoCommit=false` + `fetchSize=10000` | Kerberos 票据需预先存在 |
+| `PgConnector` | `jdbc:postgresql://` | `autoCommit=false` + `fetchSize=10000` | 不关 autoCommit 会全量拉回 |
+| `MySQLConnector` | `jdbc:mysql://` | `autoCommit=false` + `fetchSize=10000` | `useCursorFetch=true` |
+| `MSSQLConnector` | `jdbc:sqlserver://` | `autoCommit=false` + `fetchSize=10000` | 默认全缓冲 |
+| `ClickHouseConnector` | `jdbc:clickhouse://` | `autoCommit=false` + `fetchSize=10000` | — |
+| `MaxComputeConnector` | `jdbc:odps:` | 无事务，JDBC 直连 | 类型映射非标准 |
+| `H2Connector` | `jdbc:h2:` | 嵌入式或远程 | 仅供测试 |
 
 ## 7. Check 示例（阶段 1）
 
@@ -699,11 +727,9 @@ sequenceDiagram
 | 阶段 | 内容 | 新增代码 | 周期 |
 |:---:|:---|:---|:---:|
 | 1 | Parquet + Impala + DiffEngine + FieldRules + CLI | `ParquetConnector`、`ImpalaConnector` | 1 周 |
-| 2 | PostgreSQL | `PostgresConnector` | 2-3 天 |
-| 3 | MySQL | `MySQLConnector` | 2-3 天 |
-| 4 | MSSQL | `MSSQLConnector` | 2-3 天 |
-| 5 | MaxCompute | `MaxComputeConnector` | 3-5 天 |
-| 6+ | 按需 | 每源一文件 | 按需 |
+| 2 | DuckDB 文件源（CSV / Excel / JSONL） | `CsvConnector`、`ExcelConnector`、`JsonlConnector` | 1 天 |
+| 3 | JDBC 源 | `PgConnector`、`MySQLConnector`、`MSSQLConnector`、`ClickHouseConnector`、`MaxComputeConnector`、`H2Connector` | 1 周 |
+| 4+ | 按需 | 每源一文件 | 按需 |
 
 每个阶段只新增 `Connector`，不改已有代码。
 
@@ -741,7 +767,7 @@ sync_diff/
 │       │   ├── core/         # Row / FieldDiff / DiffRow / DiffSummary / Connector
 │       │   │                 # ConnectorError / FieldRules(DSL) / SequenceExt
 │       │   ├── engine/       # DiffEngine（L1 聚合 / L2 主键集合 / L3 行级）
-│       │   ├── connectors/   # ParquetConnector(DuckDB) / ImpalaConnector(Hive JDBC) / ResultSetExt
+│       │   ├── connectors/   # DuckDB文件: Parquet/Csv/Excel/Jsonl; JDBC: Impala/Pg/MySQL/MSSQL/ClickHouse/MaxCompute/H2; ResultSetExt
 │       │   └── reporter/     # Reporter（Markdown + Webhook）
 │       └── test/kotlin/com/kxxnzstdsw/sync_diff/    # 与 main 同构
 ├── checks/
