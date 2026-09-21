@@ -86,7 +86,7 @@ sealed interface Check {
      * （`null`），不要给它编造默认值的语义。
      */
     data class Args(
-        /** 上游分区日，形如 `2026-09-20`；默认 `1970-01-01` 兼容未传 dt 的场景。 */
+        /** 上游分区日，形如 `2026-09-20`；默认今天（本地时区），兼容未传 dt 的场景。 */
         val dt: String = LocalDate.now().toKotlinLocalDate().format(Format {
             year()
             char('-')

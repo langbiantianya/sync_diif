@@ -24,7 +24,7 @@ import kotlinx.coroutines.runBlocking
  * | 选项 | 默认值 | 环境变量 | 说明 |
  * |:---|:---|:---|:---|
  * | `--check` | 无，必填 | 无 | 要跑的 Check 名，与 [Check.name] 对齐 |
- * | `--dt` | `1970-01-01` | 无 | 上游分区日，原样透传给 [Check.Args.dt] |
+ * | `--dt` | 不传则用 [Check.Args.dt]（今天） | 无 | 上游分区日，显式传入才覆盖 [Check.Args.dt] |
  * | `--alert-url` | 空字符串（不发告警） | `ALERT_URL` | 告警 webhook 地址 |
  * | `--registry` | `checks.txt` | 无 | Check 注册清单文件路径 |
  *
@@ -81,12 +81,14 @@ class SyncDiffCli : CliktCommand(name = "sync_diff") {
     val check by option("--check", help = "Check name to run").required()
 
     /**
-     * 上游分区日；默认 `1970-01-01` 兼容未设 dt 的场景。
+     * 上游分区日；不传就是 `null`，**不覆盖** [Check.Args.dt] 自己的默认值（今天）。
      *
-     * 无 env 绑定。去处：装进 `Check.Args(dt = dt)` 交给 Check，通常被拼进 SQL 或
-     * Parquet 路径（如某分区目录 `dt=2026-09-20` 下的 part 文件）。
+     * 无 env 绑定。去处：[run] 第 4 步——有值时装进 `Check.Args(dt = dt)` 交给 Check，
+     * 通常被拼进 SQL 或 Parquet 路径（如某分区目录 `dt=2026-09-20` 下的 part 文件）；
+     * 为 `null` 时构造裸 `Check.Args()`。这里刻意不给默认值，否则 CLI 的常量会盖掉
+     * [Check.Args.dt] 的默认实现，"不传 dt" 永远走不到那条路径。
      */
-    val dt by option("--dt", help = "Date partition").default("1970-01-01")
+    val dt by option("--dt", help = "Date partition; defaults to Check.Args.dt (today)")
 
     /**
      * 告警 webhook；空字符串表示不发。可被 `ALERT_URL` env 覆盖。
@@ -113,7 +115,9 @@ class SyncDiffCli : CliktCommand(name = "sync_diff") {
      *    可用的 Check 名，随后进程以非零码退出。
      * 3. `(selected as? Alertable)?.alertUrl = alertUrl` —— 注入告警地址；只有实现了
      *    [Alertable] 的 Check 才吃到 [alertUrl]，其余静默忽略。
-     * 4. `runBlocking { selected.runWith(args = Check.Args(dt = dt)) }` —— 跑 Check 主体。
+     * 4. `runBlocking { selected.runWith(args = args) }` —— 跑 Check 主体，其中 `args` 是
+     *    `dt?.let { Check.Args(dt = it) } ?: Check.Args()`：`--dt` 传了才覆盖
+     *    [Check.Args.dt]，不传就用 Args 自己的默认值。
      *    [Check.runWith] 是 `suspend`（Check 内部可以开协程并发抓两侧数据），而 Clikt 的
      *    `run()` 是同步签名，所以用 [runBlocking] 在调用线程上把它跑完再返回；CLI 一次进程
      *    只跑一条 Check，不需要常驻调度器或额外的 scope。
@@ -140,8 +144,11 @@ class SyncDiffCli : CliktCommand(name = "sync_diff") {
         // 3) 把告警 webhook 注入给声明了 Alertable 的 Check；其它 Check 不关心告警
         (selected as? Alertable)?.alertUrl = alertUrl
 
-        // 4) 跑 Check 主体：suspend 函数用 runBlocking 桥到同步 main
-        runBlocking { selected.runWith(args = Check.Args(dt = dt)) }
+        // 4) 跑 Check 主体：suspend 函数用 runBlocking 桥到同步 main。
+        //    --dt 只在显式传入时才装进 Args；不传时构造裸 Check.Args()，让 [Check.Args.dt]
+        //    自己的默认值生效（CLI 不再拿 1970-01-01 兜底）。
+        val args: Check.Args = dt?.let { provided -> Check.Args(dt = provided) } ?: Check.Args()
+        runBlocking { selected.runWith(args = args) }
     }
 }
 

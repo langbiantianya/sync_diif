@@ -116,7 +116,7 @@ Top diff keys are reported in the linked L3 detail file.
 | 选项 | 必填 | 默认值 | 环境变量 | 说明 |
 |:---|:---:|:---|:---|:---|
 | `--check` | ✅ | — | — | 要跑的 Check 名（区分大小写），与 `Check.name` 对齐 |
-| `--dt` | | `1970-01-01` | — | 上游分区日，装进 `Check.Args.dt` |
+| `--dt` | | 不传则用 `Check.Args.dt`（今天） | — | 上游分区日，装进 `Check.Args.dt`；显式传入才覆盖 |
 | `--alert-url` | | 空（不发告警） | `ALERT_URL` | 告警 webhook；只有实现 `Alertable` 的 Check 会收到 |
 | `--registry` | | `checks.txt` | — | Check 注册清单文件路径 |
 | `-h`, `--help` | | — | — | 打印用法 |
@@ -227,7 +227,7 @@ object UserSyncCheck : CheckBase("user_sync") {
 ### 3.2 参数的取用
 
 ```kotlin
-data class Args(val dt: String = "1970-01-01", val params: Map<String, String> = emptyMap())
+data class Args(val dt: String = LocalDate.now() /* 今天 */, val params: Map<String, String> = emptyMap())
 
 val dt = args.dt
 val table = args.params["tgt_table"] ?: "ods.orders"     // 取不到就是没配
