@@ -25,7 +25,7 @@ flowchart TD
     Check["Check (Kotlin 对象)<br/>自己持有上下游 Connector 与配置"]
     Parquet["ParquetConnector<br/>(DuckDB)"]
     Impala["ImpalaConnector<br/>(Hive JDBC)"]
-    DuckDBFile["DuckDB 文件连接器<br/>(Parquet/CSV/Excel/JSONL)"]
+    DuckDBFile["DuckDB 文件连接器<br/>(Parquet/CSV/Excel/JSONL)<br/>+ DuckDBConnector(多源attach)"]
     Jdbc["JDBC 连接器<br/>(PG/MySQL/MSSQL/CH/MC)"]
     Future["…<br/>(按需新增)"]
     Engine["DiffEngine"]
@@ -409,7 +409,7 @@ inline infix fun <T> Iterable<T>.forEachParallel(crossinline block: suspend (T) 
 | `equals/hashCode/toString` 手写 | `data class` |
 | `switch (x) { case A: ...; default: }` | `when (x) { is A -> ...; else -> ... }` |
 
-## 5. DuckDB 文件连接器（Parquet / CSV / Excel / JSONL）
+## 5. DuckDB 文件连接器（Parquet / CSV / Excel / JSONL）+ DuckDBConnector
 
 ### 5.1 ParquetConnector
 
@@ -515,9 +515,9 @@ JsonlConnector("/data/orders/2026-09-01.jsonl").use { src ->
 
 ## 6. 已实现的连接器
 
-### 6.1 DuckDB 文件连接器
+### 6.1 DuckDB 连接器
 
-共用同一个 `jdbc:duckdb:` in-process 引擎，读文件不额外占用 JVM 堆。
+共用同一个 `jdbc:duckdb:` in-process 引擎，读文件不额外占用 JVM 堆。`DuckDBConnector` 允许用户在 `setupSql` 中附加任意外部数据源（PostgreSQL / MySQL / SQLite / 其他 DuckDB），实现跨源 SQL 查询。
 
 | 连接器 | DuckDB 函数 | 说明 |
 |:---|:---|:---|
@@ -525,6 +525,7 @@ JsonlConnector("/data/orders/2026-09-01.jsonl").use { src ->
 | `CsvConnector` | `read_csv_auto` | CSV / TSV，自动推断类型 |
 | `ExcelConnector` | `st_read`（excel 扩展） | `.xlsx`，需 `INSTALL/LOAD excel` |
 | `JsonlConnector` | `read_jsonl` | JSONL（每行一个 JSON 对象） |
+| `DuckDBConnector` | 用户自定义 `ATTACH` | 多数据源 `ATTACH`（PG/MySQL/SQLite/DuckDB），跨源 SQL 查询 |
 
 S3/OSS：路径含 `s3://` / `oss://` 时自动 `INSTALL/LOAD httpfs`。
 
