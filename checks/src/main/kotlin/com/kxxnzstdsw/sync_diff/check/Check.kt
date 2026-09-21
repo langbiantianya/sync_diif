@@ -21,7 +21,7 @@ import java.time.LocalDate
  *
  *         val sql = "SELECT COUNT(*) AS c FROM read_parquet('/data/orders/dt=$dt/part-0.parquet')"
  *         diff.aggregate(src query sql, tgt query sql, keys = listOf("dt"))    // ④ 本次执行
- *         report.markdown("reports/order_sync.md", diff.summary())             // ⑤ 本次执行
+ *         report.excel("reports/order_sync.xlsx", diff.summary())             // ⑤ 本次执行
  *     }
  * }
  * ```
@@ -104,9 +104,10 @@ sealed interface Check {
  *
  * 设计要点：
  * - 顶层类（不是 `Check.Ctx`），让 `override fun Ctx.run()` 在子类里直接用 `Ctx` 不用 import。
- * - **每次执行一个实例**：由 [Check.runWith] 新建。[DiffEngine] 带着可变计数器、
- *   [Reporter] 不是线程安全的，共享单例会让并发跑同一 Check 时互相污染，
- *   所以这里不做 `object`。同一次执行内两侧 `Connector` 仍由调用方 `use { }` 管理生命周期。
+ * - **每次执行一个实例**：由 [Check.runWith] 新建。[DiffEngine] 带着可变计数器，共享单例会让
+ *   并发跑同一 Check 时互相污染；[Reporter] 本身无状态可复用，但跟着 [Ctx] 每次 new 一个，
+ *   语义一致也不需要调用方区分谁有状态谁没有，所以这里不做 `object`。
+ *   同一次执行内两侧 `Connector` 仍由调用方 `use { }` 管理生命周期。
  * - `args` 走 [Args]（含默认值），少传字段用 `args.copy(dt = ...)`。
  */
 class Ctx(
@@ -114,7 +115,7 @@ class Ctx(
     val args: Check.Args,
     /** diff 引擎；留给 §3.2 的 L1 / L2 / L3 使用。 */
     val diff: DiffEngine = DiffEngine(),
-    /** Markdown + Webhook 输出。 */
+    /** Excel + Webhook 输出。 */
     val report: Reporter = Reporter(),
 )
 

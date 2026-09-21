@@ -91,7 +91,7 @@ object OrderSyncCheck : CheckBase("order_sync"), Alertable {
         val (srcConn, tgtConn) = injected ?: defaultConnectors()
 
         val summary = runCheck(srcConn, tgtConn, dt, engine = diff)
-        report.markdown("reports/order_sync_${dt}.md", summary)
+        report.excel("reports/order_sync_${dt}.xlsx", summary)
         if (alertUrl.isNotEmpty()) {
             report.webhook(alertUrl, summary)
         }

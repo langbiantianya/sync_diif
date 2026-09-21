@@ -10,19 +10,20 @@ import java.util.*
 /**
  * Impala 连接配置：放在连接器内部，因为只有 [ImpalaConnector] 消费它的字段。
  *
- * JDBC URL 形态：`jdbc:impala://host:21050/default;AuthMech=0`——库名可省，驱动参数用 `;` 接在后面。
+ * JDBC URL 形态：`jdbc:hive2://host:21050/default`——驱动已切到 `org.apache.hive:hive-jdbc`，
+ * scheme 必须用 `jdbc:hive2://`（旧的 `jdbc:impala://` 找不到匹配驱动）。库名可省，驱动参数用 `;` 接在后面。
  * ```kotlin
- * ImpalaConfig("jdbc:impala://impala-prod:21050/ods")                                 // 无认证
- * ImpalaConfig("jdbc:impala://impala-prod:21050/ods", "etl", "secret")                // 用户名 + 密码
- * ImpalaConfig("jdbc:impala://impala-prod:21050/ods;AuthMech=1;KrbRealm=EXAMPLE.COM")  // Kerberos
+ * ImpalaConfig("jdbc:hive2://impala-prod:21050/ods")                          // 无认证
+ * ImpalaConfig("jdbc:hive2://impala-prod:21050/ods", "etl", "secret")         // 用户名 + 密码（LDAP）
+ * ImpalaConfig("jdbc:hive2://impala-prod:21050/ods;principal=hive/_HOST@REALM")  // Kerberos
  * ```
  *
- * 三种认证模式：
- * - **无认证**（`AuthMech=0`，测试 / 内网）：[user] / [password] 都留 `null`。
- * - **LDAP / 用户名密码**（`AuthMech=3`）：凭据可写进 url，也可交给 [user] / [password]。
+ * 三种认证模式（hive-jdbc 语义）：
+ * - **无认证**（测试 / 内网）：url 不带 `auth=` / `principal=`，[user] / [password] 都留 `null`。
+ * - **LDAP / 用户名密码**（url 带 `auth=LDAP`）：凭据可写进 url，也可交给 [user] / [password]。
  *   填了 [user] 时 [ImpalaConnector] 会用 JDBC `Properties` 把 user（以及非空 password）
  *   传给驱动；[user] 为空则完全不带凭据，直接 `DriverManager.getConnection(url)`。
- * - **Kerberos**（`AuthMech=1`，另加 `Principal=` / `KrbRealm=`）：认证信息在 url 与 ticket 里，
+ * - **Kerberos**（url 带 `principal=hive/_HOST@REALM`）：认证信息在 url 与 ticket cache 里，
  *   [user] / [password] 通常留空。
  *
  * [user] / [password] 分开可空，是为了只在需要 `Properties` 的 LDAP 场景下才填。
@@ -39,8 +40,11 @@ data class ImpalaConfig(
         /**
          * 兜底默认 JDBC URL：开发者 `git clone && ./gradlew run` 直接跑起来的最小配置。
          * 改地址请走 env (`IMPALA_JDBC_URL`)，不要改这个常量。
+         *
+         * 驱动已切到 `org.apache.hive:hive-jdbc`，URL scheme 必须从 `jdbc:impala://`
+         * 改为 `jdbc:hive2://`，否则 `DriverManager` 找不到匹配驱动直接抛。
          */
-        const val DEFAULT_JDBC_URL: String = "jdbc:impala://localhost:21050"
+        const val DEFAULT_JDBC_URL: String = "jdbc:hive2://localhost:21050"
 
         /** 默认值：URL 用 [DEFAULT_JDBC_URL]，无凭据。多数 Check 的 [fromEnv] 起点。 */
         val DEFAULT: ImpalaConfig = ImpalaConfig(DEFAULT_JDBC_URL)
@@ -75,10 +79,10 @@ data class ImpalaConfig(
  * 构造时设置 `autoCommit`；`fetchSize` 由 [Connector.query] / [Connector.stream] 对每个
  * 语句单独设置，所以 `query()` 也是按批拉取，只是最后会在 JVM 堆里聚成 `List<Row>`。
  *
- * 凭据三种形态，[ImpalaConfig] 的 `jdbcUrl` / `user` / `password` 与之配套：
- * - 无认证：url 里 `AuthMech=0`，`user` / `password` 留空；
- * - LDAP：url 里 `AuthMech=3`，凭据通过 `user` / `password` 以 JDBC `Properties` 下发；
- * - Kerberos：url 里配 `AuthMech=1` / `KrbRealm` / `KrbHostFQDN` / `KrbServiceName`，
+ * 凭据三种形态，[ImpalaConfig] 的 `jdbcUrl` / `user` / `password` 与之配套（hive-jdbc 语义）：
+ * - 无认证：url 不带 `auth=` / `principal=`，`user` / `password` 留空；
+ * - LDAP：url 里 `auth=LDAP`，凭据通过 `user` / `password` 以 JDBC `Properties` 下发；
+ * - Kerberos：url 里配 `principal=hive/_HOST@REALM`（Hive 3 也接受 `;transportMode=http` 等可选），
  *   票据由 JVM 从 Kerberos ticket cache 取，`user` / `password` 留空。
  *
  * 内部 `open()` 在 `user` 为空时不带 `Properties`，直接按 url 建连；只要给了 `user`
@@ -93,7 +97,7 @@ data class ImpalaConfig(
  * - 直接传 url + 可选凭据 + fetchSize（临时调试 / 测试用）。
  *
  * ```kotlin
- * val cfg = ImpalaConfig("jdbc:impala://impala-host:21050/default;AuthMech=0")
+ * val cfg = ImpalaConfig("jdbc:hive2://impala-host:21050/default")
  *
  * ImpalaConnector(cfg).use { tgt ->
  *     tgt.stream("SELECT order_id, amount FROM ods.orders WHERE dt = '2026-09-01'")

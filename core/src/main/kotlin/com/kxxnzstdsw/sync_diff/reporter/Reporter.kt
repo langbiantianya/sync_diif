@@ -1,144 +1,141 @@
 package com.kxxnzstdsw.sync_diff.reporter
 
-import com.kxxnzstdsw.sync_diff.core.DiffLevel
 import com.kxxnzstdsw.sync_diff.core.DiffSummary
 import java.io.IOException
+import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URL
-import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 
 /**
- * 对账结果输出：Markdown 报告 + 可选 Webhook 告警（README §4.5 末尾那段链路）。
+ * 对账结果输出：Excel 报告 + 可选 Webhook 告警。
  *
- * 依赖只有 JDK 8 stdlib；不引 OkHttp / Ktor。
+ * 报告是 `.xlsx`，一个 Check 一次执行一个工作簿。落盘细节见 [XlsxWriter]，
+ * [excel] 里的标准汇总块（`render(summary) {}` 的真实输出）：
  *
- * [markdown] 落盘的报告原文（[renderMarkdown] 的真实输出）：
- *
- * ```markdown
- * # Diff Summary
- *
- * | metric | value |
- * |:---|---:|
- * | level | WARN |
- * | src rows | 100 |
- * | tgt rows | 99 |
- * | diff keys | 7 |
- *
- * > hasDiff = true
- *
- * Top diff keys are reported in the linked L3 detail file.
+ * ```
+ * sheet「Diff Summary」
+ *   A1  Diff Summary                                     ← 加粗标题（与 sheet 名同源）
+ *   A2  metric        B2  value                          ← 加粗表头（灰底）
+ *   A3  level         B3  WARN
+ *   A4  src rows      B4  100
+ *   A5  tgt rows      B5  99
+ *   A6  diff keys     B6  7
+ *   A7  hasDiff = true
+ *   A8  Top diff keys are reported in the linked L3 detail file.
  * ```
  *
- * 表格固定四行（level / src rows / tgt rows / diff keys），级别单元格直接写 INFO / WARN / ERROR；
- * 末两段只在 `hasDiff == true` 时追加，无差异时报告到 `> hasDiff = false` 为止。汇总块本身不含
+ * 四行汇总（level / src rows / tgt rows / diff keys）是固定内容：`level` 单元格写
+ * INFO / WARN / ERROR，行数三行是**数字单元格**（可在 Excel 里直接求和 / 排序）。
+ * `hasDiff` 一行总是写，指向 L3 明细的说明只在 `hasDiff == true` 时追加。汇总块本身不含
  * row-level 明细——差异明细、业务字段对照这类内容由 Check 自己追加，见下面的自定义内容。
  *
- * [webhook] POST 出去的 JSON body（[renderJson] 的真实输出）：
+ * [webhook] POST 出去的 JSON body（[renderJson] 的真实输出）**不变**，与报告格式无关：
  *
  * ```json
  * {"level":"WARN","srcCount":100,"tgtCount":99,"diffCount":7,"hasDiff":true}
  * ```
  *
- * `level` 是 [DiffLevel] 的 `name`，其余字段名与 [DiffSummary] 的属性名一致（camelCase）。
+ * `level` 是 [com.kxxnzstdsw.sync_diff.core.DiffLevel] 的 `name`，其余字段名与 [DiffSummary]
+ * 的属性名一致（camelCase）。
  *
  * ## 自定义内容
  *
- * [markdown] 有三种写法，都是覆盖写、UTF-8、自动创建父目录：
+ * [excel] 有三种写法，都是覆盖写、自动创建父目录：
  *
  * ```kotlin
  * // ① 只有标准汇总块
- * report.markdown("reports/order_sync_$dt.md", summary)
+ * report.excel("reports/order_sync_$dt.xlsx", summary)
  *
- * // ② 汇总块 + Check 追加的自定义内容
- * report.markdown("reports/order_sync_$dt.md", summary) {
+ * // ② 汇总块 + Check 追加的自定义内容（每个 heading 一张 sheet）
+ * report.excel("reports/order_sync_$dt.xlsx", summary) {
  *     heading("差异明细（抽样）")
  *     table(
  *         headers = listOf("层次", "列", "主键", "src", "tgt"),
  *         rows = rows.map { it.toCells() },          // Iterable<Iterable<Any?>>
- *         aligns = listOf(Align.LEFT, Align.LEFT, Align.LEFT, Align.RIGHT, Align.RIGHT),
  *     )
- *     paragraph("> 只列抽样命中的差异，未命中不代表一致。")
+ *     paragraph("只列抽样命中的差异，未命中不代表一致。")
  * }
  *
  * // ③ 完全自定义，不写汇总块（报告长什么样全由 Check 决定）
- * report.markdown("reports/inspect_$dt.md") {
- *     heading("巡检结果", level = 1)
+ * report.excel("reports/inspect_$dt.xlsx") {
+ *     heading("巡检结果")
  *     bullets(listOf("分区齐全", "part 文件数与上游一致"))
  * }
  * ```
  *
- * 内容用 [MarkdownBuilder] 的 DSL 拼：`heading` / `paragraph` / `bullets` / `table` /
- * `code` / `raw`。其中 [MarkdownBuilder.table] 只是 [markdownTable] 的落笔形式——
- * 需要「先拿字符串、再决定写哪儿」（比如同一份内容既落盘又进 webhook body）时，
- * 直接用 `MarkdownBuilder().apply { … }.toString()`，或调 [markdownTable] 单出那张表。
+ * 内容用 [ExcelBuilder] 的 DSL 拼：`heading` / `paragraph` / `bullets` / `table`。
+ * 其中 [ExcelBuilder.heading] 会开一张新 sheet（标题同时写进 sheet 名与首行），
+ * 所以「一张明细表 = 一张 sheet」是自然落法，不用自己算单元格坐标。
  *
  * 一个 Reporter 实例无状态，可复用；所有方法只读 [summary]，自定义内容在调用点上就地渲染
- * （每次 [markdown] 都新建 [MarkdownBuilder]），并发调不同 [markdown] 不会互相污染。
+ * （每次 [excel] 都新建 [ExcelBuilder]），并发调不同 [excel] 不会互相污染。
  */
 class Reporter {
 
     /**
-     * 写一份 Markdown 报告到 [path]，**覆盖**已存在的文件（不是追加）。
+     * 写一份 Excel 报告到 [path]，**覆盖**已存在的文件（不是追加）。
      *
      * 父目录不存在会自动创建（`Files.createDirectories`）；[path] 没有父目录（裸文件名）时
-     * 写到当前目录。编码 UTF-8，换行是 LF。内容结构见 [Reporter] 类注释。
+     * 写到当前目录。内容结构见 [Reporter] 类注释。
      *
      * ```kotlin
      * val summary: DiffSummary = engine.summary()
-     * Reporter().markdown("reports/order_sync_$dt.md", summary)
+     * Reporter().excel("reports/order_sync_$dt.xlsx", summary)
      * ```
      *
      * 与 [webhook] 不同，本方法**会抛** IO 异常（[java.io.IOException] / 权限、磁盘满等）：
      * 报告是对账的交付物，写不出来就应该失败，而不是静默吞掉。
      */
-    fun markdown(path: String, summary: DiffSummary): Unit = markdown(Paths.get(path), summary)
+    fun excel(path: String, summary: DiffSummary): Unit = excel(Paths.get(path), summary)
 
-    /** 同 [markdown]，但接收 [Path]；方便测试里用 `Files.createTempFile`。 */
-    fun markdown(path: Path, summary: DiffSummary) {
-        write(path, render(summary) {}.toString())
+    /** 同 [excel]，但接收 [Path]；方便测试里用 `Files.createTempFile`。 */
+    fun excel(path: Path, summary: DiffSummary) {
+        write(path, render(summary) {})
     }
 
     /**
-     * 标准汇总块 + [body] 追加的自定义内容（表格 / 说明 / 代码块……），写盘语义同 [markdown]。
+     * 标准汇总块 + [body] 追加的自定义内容（表格 / 说明 / 清单……），写盘语义同 [excel]。
      *
      * ```kotlin
-     * report.markdown("reports/wilson_$dt.md", summary) {
+     * report.excel("reports/wilson_$dt.xlsx", summary) {
      *     heading("差异明细（抽样）")
-     *     table(listOf("列", "主键", "src", "tgt"), cells, aligns = ALIGNS)
+     *     table(listOf("列", "主键", "src", "tgt"), cells)
      * }
      * ```
      *
      * [body] 在汇总块之后调用，可以挂任意多段；抛异常同样会中断写盘（内容没准备好就不该产出报告）。
+     * 带 [ExcelBuilder.heading] 的内容各自落到新 sheet，不带 heading 的内容接在「Diff Summary」
+     * sheet 的汇总块下面。
      */
-    fun markdown(path: String, summary: DiffSummary, body: MarkdownBuilder.() -> Unit): Unit =
-        markdown(Paths.get(path), summary, body)
+    fun excel(path: String, summary: DiffSummary, body: ExcelBuilder.() -> Unit): Unit =
+        excel(Paths.get(path), summary, body)
 
-    /** 同 [markdown] 的三参版本，但接收 [Path]。 */
-    fun markdown(path: Path, summary: DiffSummary, body: MarkdownBuilder.() -> Unit) {
-        write(path, render(summary, body).toString())
+    /** 同 [excel] 的三参版本，但接收 [Path]。 */
+    fun excel(path: Path, summary: DiffSummary, body: ExcelBuilder.() -> Unit) {
+        write(path, render(summary, body))
     }
 
     /**
-     * 完全自定义的报告：不写标准汇总块，内容全部由 [body] 决定。写盘语义同 [markdown]。
+     * 完全自定义的报告：不写标准汇总块，内容全部由 [body] 决定。写盘语义同 [excel]。
      *
      * 适合输出与 [DiffSummary] 无关的结果（巡检结论、上游表结构、耗时分布……）：
      *
      * ```kotlin
-     * report.markdown("reports/inspect_$dt.md") {
-     *     heading("巡检结果", level = 1)
+     * report.excel("reports/inspect_$dt.xlsx") {
+     *     heading("巡检结果")
      *     bullets(listOf("分区齐全", "part 文件数与上游一致"))
      * }
      * ```
      *
      * 注意这样写出来的报告没有 level / 行数 / 差异数，webhook 那边仍应单独发 [DiffSummary]。
      */
-    fun markdown(path: String, body: MarkdownBuilder.() -> Unit): Unit = markdown(Paths.get(path), body)
+    fun excel(path: String, body: ExcelBuilder.() -> Unit): Unit = excel(Paths.get(path), body)
 
-    /** 同 [markdown] 的两参 lambda 版本，但接收 [Path]。 */
-    fun markdown(path: Path, body: MarkdownBuilder.() -> Unit) {
-        write(path, MarkdownBuilder().apply(body).toString())
+    /** 同 [excel] 的两参 lambda 版本，但接收 [Path]。 */
+    fun excel(path: Path, body: ExcelBuilder.() -> Unit) {
+        write(path, ExcelBuilder().apply(body))
     }
 
     /**
@@ -151,15 +148,15 @@ class Reporter {
      *   长度用 `setFixedLengthStreamingMode` 预声明。
      * - 响应码不在 2xx：内部抛 `IOException`，随即被同一条兜底吞掉。
      * - **任意 IO 异常本方法都不抛**：网络不通、DNS 失败、webhook 服务 5xx、读超时——
-     *   一律静默。这是设计意图而非遗漏：对账结果已经落成 Markdown 报告（[markdown] 那边
-     *   写失败会抛），告警链路只是通知手段，不该把整条对账流程带崩。
+     *   一律静默。这是设计意图而非遗漏：对账结果已经落成 Excel 报告（[excel] 那边写失败会抛），
+     *   告警链路只是通知手段，不该把整条对账流程带崩。
      *   代价是调用方拿不到投递失败的信号，需要「告警必达」时得另加监控或自己发请求。
      *
      * 真实接法（`OrderSyncCheck` 的写法，`alertUrl` 由 CLI / 环境变量注入）：
      *
      * ```kotlin
      * val summary = engine.summary()
-     * report.markdown("reports/order_sync_$dt.md", summary)
+     * report.excel("reports/order_sync_$dt.xlsx", summary)
      * if (alertUrl.isNotEmpty()) report.webhook(alertUrl, summary)   // 判空可省，webhook 自己会跳过
      * ```
      */
@@ -185,40 +182,36 @@ class Reporter {
         }
     }
 
-    // --- 渲染层（公开便于单测；不是 public API） ---
-
-    internal fun renderMarkdown(summary: DiffSummary): String = render(summary) {}.toString()
+    // --- 渲染层（不是 public API） ---
 
     /**
-     * 报告文档：标准汇总块 + [body] 追加的自定义块。
+     * 报告工作簿内容：标准汇总块 + [body] 追加的自定义块。
      *
-     * 汇总块的字节输出沿用旧实现（`# Diff Summary` 标题 → 四行 kv 表 → `> hasDiff = …`
-     * → 有差异时补一句指向 L3 明细的说明），因此 [renderMarkdown] 的输出与历史报告一致。
+     * 汇总块的信息面沿用旧报告（`# Diff Summary` 标题 → 四行 kv 表 → `hasDiff = …`
+     * → 有差异时补一句指向 L3 明细的说明），只是落点换成了 Excel 单元格。
      */
-    private fun render(summary: DiffSummary, body: MarkdownBuilder.() -> Unit): MarkdownBuilder =
-        MarkdownBuilder().apply {
-            heading("Diff Summary", level = 1)
+    private fun render(summary: DiffSummary, body: ExcelBuilder.() -> Unit): ExcelBuilder =
+        ExcelBuilder().apply {
+            heading("Diff Summary")
             table(
                 headers = listOf("metric", "value"),
                 rows = listOf(
-                    listOf("level", summary.level.badge()),
+                    listOf("level", summary.level.name),
                     listOf("src rows", summary.srcCount),
                     listOf("tgt rows", summary.tgtCount),
                     listOf("diff keys", summary.diffCount),
                 ),
-                aligns = listOf(Align.LEFT, Align.RIGHT),
             )
-            paragraph("> hasDiff = ${summary.hasDiff}")
+            paragraph("hasDiff = ${summary.hasDiff}")
             if (summary.hasDiff) {
                 paragraph("Top diff keys are reported in the linked L3 detail file.")
             }
             body()
         }
 
-    /** 落盘：建父目录 + UTF-8 覆盖写。三个 [markdown] 入口共用。 */
-    private fun write(path: Path, content: String) {
-        Files.createDirectories(path.parent ?: Paths.get("."))
-        Files.write(path, content.toByteArray(Charsets.UTF_8))
+    /** 落盘：建父目录 + 覆盖写一份最小 OOXML 工作簿，见 [XlsxWriter]。 */
+    private fun write(path: Path, builder: ExcelBuilder) {
+        XlsxWriter.write(path, builder.sheets)
     }
 
     internal fun renderJson(summary: DiffSummary): String = buildString {
@@ -231,12 +224,6 @@ class Reporter {
         append('}')
     }
 
-    private fun DiffLevel.badge(): String = when (this) {
-        DiffLevel.INFO -> "INFO"
-        DiffLevel.WARN -> "WARN"
-        DiffLevel.ERROR -> "ERROR"
-    }
-
     private companion object {
         const val CONNECT_TIMEOUT_MS: Int = 5_000
         const val READ_TIMEOUT_MS: Int = 10_000
@@ -244,152 +231,187 @@ class Reporter {
 }
 
 /**
- * Markdown 表格列对齐。[markdownTable] / [MarkdownBuilder.table] 的 `aligns` 参数用。
+ * Excel 报告的表格拼装器：把「标题 / 段落 / 清单 / 表格」四种块按顺序落到工作簿上。
  *
- * 对应对齐标记：`---` / `:---` / `:---:` / `---:`。多数渲染器把它当排版建议而不是硬约束，
- * 所以选错只是不美观，不会让表格失效。
- */
-enum class Align(internal val marker: String) {
-    /** `---`：不声明对齐，交给渲染器按内容决定。 */
-    DEFAULT("---"),
-
-    /** `:---`：左对齐；文字列、主键列的常规选择。 */
-    LEFT(":---"),
-
-    /** `:---:`：居中。 */
-    CENTER(":---:"),
-
-    /** `---:`：右对齐；数字列（计数、金额）的常规选择。 */
-    RIGHT("---:"),
-}
-
-/**
- * 渲染一张 Markdown 表格，返回**不含尾换行**的多行字符串（行之间用 `\n`）。
- *
- * 输出形状（`aligns = [Align.LEFT, Align.RIGHT]`）：
- *
- * ```markdown
- * | metric | value |
- * |:---|---:|
- * | level | WARN |
- * ```
- *
- * 单元格渲染规则：
- * - `null` 写成 `null`（不折叠成空串——对账报告里「没有值」和「值是空串」必须能区分）。
- * - 其它值走 `toString()`。
- * - `|` 转义成 `\|`，换行折叠成 `<br>`：Markdown 表格的一行就是一行，不处理会把表格切碎。
- *
- * 参数校验走 fail fast（[IllegalArgumentException]），不静默产出错位表格：
- * - [headers] 不能为空；
- * - [aligns] 要么为空（全部 [Align.DEFAULT]），要么与 [headers] 等长；
- * - 每一行的列数必须等于 [headers] 的列数。
- *
- * [rows] 只遍历一次：一次性视图（不支持二次遍历的实现）也能安全传入。
- */
-fun markdownTable(
-    headers: List<String>,
-    rows: Iterable<Iterable<Any?>>,
-    aligns: List<Align> = emptyList(),
-): String {
-    require(headers.isNotEmpty()) { "markdown table needs at least one column" }
-    require(aligns.isEmpty() || aligns.size == headers.size) {
-        "aligns has ${aligns.size} entries but the table has ${headers.size} columns"
-    }
-    val alignment: List<Align> = aligns.ifEmpty { List(headers.size) { Align.DEFAULT } }
-
-    val lines = ArrayList<String>(8)
-    lines += headers.joinToString(separator = " | ", prefix = "| ", postfix = " |") { escapeCell(it) }
-    // 分隔行不带空格填充：与表头 / 数据行的 `| a | b |` 风格不同，但这是 Markdown 的常规写法
-    // （`|:---|---:|`），也是历史报告里汇总表的样子——保持字节不变，别动。
-    lines += "|" + alignment.joinToString("|") { it.marker } + "|"
-    rows.forEachIndexed { index, row ->
-        val cells = row.toList()
-        require(cells.size == headers.size) {
-            "markdown table row ${index + 1} has ${cells.size} cells but the table has ${headers.size} columns"
-        }
-        lines += cells.joinToString(separator = " | ", prefix = "| ", postfix = " |") { escapeCell(it.toString()) }
-    }
-    return lines.joinToString("\n")
-}
-
-/** 单元格转义：`|` 不转义会切断单元格，换行不折叠会把表格行拆成两行。 */
-private fun escapeCell(text: String): String =
-    text.replace("|", "\\|").replace("\r\n", "\n").replace("\n", "<br>")
-
-/**
- * Markdown 文档拼装器：Check 输出自定义报告内容时用它，不用手写竖线与空行。
- *
- * 每个方法追加一个**块**（块之间恰好隔一个空行），返回 `this` 以便链式调用；
- * [toString] 收尾时去掉尾部空行、保留一个 `\n`，空文档则是空串。拼接规则与
- * [Reporter] 的标准汇总块一致，所以两种内容混排不会出现双空行或粘连。
+ * **一个 [heading] 一张 sheet**：标题既当 sheet 名（Excel 标签页，非法字符会被替换、
+ * 超 31 字符截断、重名自动加序号），又当该 sheet 的首行加粗标题——所以信息不会因为
+ * sheet 名截断而丢失。标题之前的内容（一般是标准汇总块）落在默认 sheet「Report」上，
+ * 第一个 [heading] 会给这张还没写内容的默认 sheet 改名，不会留下空 sheet。
  *
  * ```kotlin
- * val md = MarkdownBuilder().apply {
- *     heading("差异明细")
- *     table(listOf("列", "src", "tgt"), rows, aligns = listOf(Align.LEFT, Align.RIGHT, Align.RIGHT))
- *     paragraph("样本只覆盖抽样命中的主键。")
- * }.toString()
+ * Reporter().excel("reports/detail.xlsx") {
+ *     heading("差异明细")                       // sheet「差异明细」
+ *     table(listOf("列", "src", "tgt"), rows)   // 表头加粗，逐行落格
+ * }
  * ```
  *
- * 块内容一律**原样落笔**（除表格单元格的转义）：[paragraph] / [raw] 里可以写任意 Markdown
- * （引用、链接、HTML），本类不做二次加工，也不会把 `*` `_` 之类转义掉。
+ * 单元格取值规则（[table] / [paragraph] / [bullets] 一致）：
+ * - `null` 写成文本 `null`（不折叠成空单元格——对账报告里「没有值」和「值是空串」必须能区分）；
+ * - [Number] 写成**数字单元格**（可在 Excel 里直接求和 / 排序；NaN / Infinity 退回文本，
+ *   Excel 存不了这两个值）；[Boolean] 写成布尔单元格；其余走 `toString()`；
+ * - `Long` / `BigDecimal` 超出 double 精确范围（±2^53 ／ 15 位有效数字）时退回文本，
+ *   免得 64 位 checksum 被四舍五入（见 [ExcelBuilder.normalize]）。
+ *
+ * [table] 的参数校验走 fail fast（[IllegalArgumentException]），不静默产出错位表格：
+ * [headers] 不能为空，每一行的列数必须等于 [headers] 的列数。
  */
-class MarkdownBuilder {
+class ExcelBuilder internal constructor() {
 
-    private val out = StringBuilder()
+    /** 全部 sheet，顺序即落盘顺序；[Reporter] 直接交给 [XlsxWriter]。 */
+    internal val sheets: MutableList<Sheet> = mutableListOf(Sheet(DEFAULT_SHEET_NAME))
+
+    private var sheet: Sheet = sheets.first()
+    private var headingSeen: Boolean = false
+    private var sheetHasContent: Boolean = false
 
     /**
-     * 标题：`#` × [level] + 空格 + [text]。
+     * 开一节：新起一张 sheet 并把 [text] 写成它的首行加粗标题（sheet 名同源，见类注释）。
      *
-     * [level] 取 1..6（对应 `#` 到 `######`），越界抛 [IllegalArgumentException]：
-     * 7 个 `#` 不是标题，行内渲染成普通段落，报告会静默变形。
+     * 当前 sheet 还没写任何内容、也还没出现过标题时，直接给默认 sheet 改名，
+     * 避免「完全自定义」写法留一张空的「Report」sheet。
      */
-    fun heading(text: String, level: Int = 2): MarkdownBuilder {
-        require(level in 1..6) { "markdown heading level must be in 1..6, got $level" }
-        return block("#".repeat(level) + " " + text)
+    fun heading(text: String): ExcelBuilder {
+        if (headingSeen || sheetHasContent) {
+            sheet = Sheet(uniqueSheetName(text, except = null)).also { sheets += it }
+            sheetHasContent = false
+        } else {
+            sheet.name = uniqueSheetName(text, except = sheet)
+        }
+        headingSeen = true
+        return writeRow(listOf(text), CellStyle.TITLE)
     }
 
-    /** 一个段落；[text] 内部可以有换行（原样保留），但整段算一个块。 */
-    fun paragraph(text: String): MarkdownBuilder = block(text)
+    /** 一段说明文字，占一行。 */
+    fun paragraph(text: String): ExcelBuilder = writeRow(listOf(text), CellStyle.BODY)
 
-    /** 无序列表：每条目一行 `- ` 前缀；空集合不产生内容（也不会留下空行）。 */
-    fun bullets(items: Iterable<String>): MarkdownBuilder {
-        val body = items.joinToString("\n") { "- $it" }
-        return if (body.isEmpty()) this else block(body)
+    /** 无序清单：每条目一行，行首加 `• `；空集合不产生任何行。 */
+    fun bullets(items: Iterable<String>): ExcelBuilder {
+        items.forEach { writeRow(listOf("• $it"), CellStyle.BODY) }
+        return this
     }
 
     /**
-     * 表格，渲染细节见 [markdownTable]（含转义与列数校验）。
+     * 表格：一行加粗表头 + 每个数据行一行。
      *
      * ```kotlin
      * table(
      *     headers = listOf("列", "src", "tgt"),
      *     rows = listOf(listOf("amount", 10, 12)),
-     *     aligns = listOf(Align.LEFT, Align.RIGHT, Align.RIGHT),
      * )
      * ```
      */
-    fun table(
-        headers: List<String>,
-        rows: Iterable<Iterable<Any?>>,
-        aligns: List<Align> = emptyList(),
-    ): MarkdownBuilder = block(markdownTable(headers, rows, aligns))
-
-    /** 围栏代码块；[language] 为空就写不带语言标注的围栏（首行直接换行）。 */
-    fun code(text: String, language: String = ""): MarkdownBuilder =
-        block("```" + language + "\n" + text + "\n```")
-
-    /** 原样追加一段 Markdown：留给本类没封装的结构（嵌套列表、HTML、表格外的自定义排版）。 */
-    fun raw(markdown: String): MarkdownBuilder = block(markdown)
-
-    /** 完整文档：块间空行已就位，末尾恰好一个 `\n`；空文档返回空串。 */
-    override fun toString(): String =
-        if (out.isEmpty()) "" else out.toString().trimEnd('\n') + "\n"
-
-    /** 追加一个块（内容 + 空行）。空内容直接忽略，避免留下连续空行。 */
-    private fun block(text: String): MarkdownBuilder {
-        if (text.isEmpty()) return this
-        out.append(text).append("\n\n")
+    fun table(headers: List<String>, rows: Iterable<Iterable<Any?>>): ExcelBuilder {
+        require(headers.isNotEmpty()) { "excel table needs at least one column" }
+        writeRow(headers, CellStyle.HEADER)
+        rows.forEachIndexed { index, row ->
+            val cells = row.toList()
+            require(cells.size == headers.size) {
+                "excel table row ${index + 1} has ${cells.size} cells but the table has ${headers.size} columns"
+            }
+            writeRow(cells, CellStyle.BODY)
+        }
         return this
+    }
+
+    /** 追加一行到当前 sheet。 */
+    private fun writeRow(values: List<Any?>, style: CellStyle): ExcelBuilder {
+        sheet.rows += Row(values.map(::normalize), style)
+        sheetHasContent = true
+        return this
+    }
+
+    /**
+     * 值归一：NaN / Infinity 不是 Excel 能表示的数，落回文本（否则工作簿被判损坏）；
+     * 超出 double 精确范围的整数落回文本（见下）。
+     *
+     * `Long` / `BigDecimal` 那条是刻意的：对账里的 checksum / `SUM(hash(...))` 常年是 64 位整数，
+     * 写成数字单元格会被 Excel 的 double 表示静默四舍五入（`123456789012345678` →
+     * `123456789012345680`），报告上的数与实际数对不上比对账失败更糟。这类值不给「求和 / 排序」
+     * 的便利，换显示值与落盘值都不失真；±2^53 以内的整数照常走数字单元格。
+     */
+    private fun normalize(value: Any?): Any? = when (value) {
+        is Double -> if (value.isFinite()) value else value.toString()
+        is Float -> if (value.isFinite()) value.toDouble() else value.toString()
+        is Long -> if (value in -EXACT_INT_RANGE..EXACT_INT_RANGE) value else value.toString()
+        is BigDecimal ->
+            if (value.scale() <= MAX_EXACT_SCALE && value.abs() <= EXACT_INT_DECIMAL) {
+                value
+            } else {
+                value.toPlainString()
+            }
+        else -> value
+    }
+
+    /**
+     * 由标题 [raw] 算出一个能用的 sheet 名：非法字符换成空格、去掉首尾空格与单引号、
+     * 非空、按码点截到 31 个字符（Excel 上限），重名（不区分大小写，Excel 就是这么算的）
+     * 时后缀 ` (2)`、` (3)`……
+     *
+     * [except] 是「正在改名的那张 sheet」——它自己不算占用，否则 `heading("Report")` 之类
+     * 与默认 sheet 同名的标题会被无谓地挤成 `Report (2)`。
+     */
+    private fun uniqueSheetName(raw: String, except: Sheet?): String {
+        val base = sanitizeSheetName(raw)
+        var candidate = base
+        var index = 2
+        while (true) {
+            val taken = sheets.any { it !== except && it.name.equals(candidate, ignoreCase = true) }
+            if (!taken) return candidate
+            val suffix = " ($index)"
+            candidate = truncate(base, SHEET_NAME_LIMIT - suffix.length).trimEnd() + suffix
+            index++
+        }
+    }
+
+    private fun sanitizeSheetName(raw: String): String {
+        val cleaned = raw
+            .map { if (it in INVALID_SHEET_NAME_CHARS) ' ' else it }
+            .joinToString("")
+            .trim()
+            .trim('\'')
+            .trim()
+        val named = when {
+            cleaned.isEmpty() -> DEFAULT_SHEET_NAME
+            cleaned.equals(RESERVED_SHEET_NAME, ignoreCase = true) -> "${cleaned}_"
+            else -> cleaned
+        }
+        return truncate(named, SHEET_NAME_LIMIT)
+    }
+
+    /** 按码点截断到 [max] 个字符，不切断代理对（否则会写出半个字符）。 */
+    private fun truncate(text: String, max: Int): String {
+        if (text.length <= max) return text
+        val out = StringBuilder(max)
+        var i = 0
+        while (i < text.length) {
+            val codePoint = text.codePointAt(i)
+            val width = Character.charCount(codePoint)
+            if (out.length + width > max) break
+            out.appendCodePoint(codePoint)
+            i += width
+        }
+        return out.toString()
+    }
+
+    private companion object {
+        /** 没被任何 [heading] 命名过的 sheet 的默认名字。 */
+        const val DEFAULT_SHEET_NAME: String = "Report"
+
+        /** Excel 保留的 sheet 名，写下去 Excel 会判文件损坏。 */
+        const val RESERVED_SHEET_NAME: String = "History"
+
+        /** Excel 对 sheet 名的长度上限（字符数）。 */
+        const val SHEET_NAME_LIMIT: Int = 31
+
+        /** Excel 明确禁止出现在 sheet 名里的字符。 */
+        val INVALID_SHEET_NAME_CHARS: Set<Char> = setOf('\\', '/', '*', '?', ':', '[', ']')
+
+        /** double 能精确表示的整数上界（2^53）；超过它的整数落成文本来保住精度。 */
+        const val EXACT_INT_RANGE: Long = 1L shl 53
+
+        val EXACT_INT_DECIMAL: BigDecimal = BigDecimal(EXACT_INT_RANGE)
+
+        /** double 的十进制有效位数上界；`BigDecimal` 超过这个 scale 就意味着落 double 会丢位数。 */
+        const val MAX_EXACT_SCALE: Int = 15
     }
 }

@@ -28,7 +28,7 @@ flowchart TD
     Jdbc["JDBC 连接器<br/>(PG/MySQL/MSSQL/CH/MC)"]
     Future["…<br/>(按需新增)"]
     Engine["DiffEngine"]
-    Report["Reporter<br/>(Markdown + Webhook)"]
+    Report["Reporter<br/>(Excel + Webhook)"]
 
     Check --> DuckDBFile
     Check --> Jdbc
@@ -260,7 +260,7 @@ fun <T> Sequence<T>.sampled(ratio: Double, seed: Long = 42L): Sequence<T> = sequ
 Scope function 用法要克制：`apply` 配构造、`also` 配副作用、`with` 配临时作用域、`let` 配 null 安全链、`use` 配资源。
 
 ```kotlin
-val diffSummary = diff.summary().also { report.markdown(path, it) }
+val diffSummary = diff.summary().also { report.excel(path, it) }
     .let { if (it.hasDiff) report.webhook(env("ALERT_URL"), it); it }
 ```
 
@@ -378,7 +378,7 @@ object OrderSyncCheck : Check("order_sync") {
             }
         }
 
-        report.markdown("reports/order_sync.md", diff.summary())
+        report.excel("reports/order_sync.xlsx", diff.summary())
         diff.summary().takeIf { it.hasDiff }?.let { report.webhook(env("ALERT_URL"), it) }
     }
 }
@@ -501,7 +501,7 @@ JsonlConnector("/data/orders/2026-09-01.jsonl").use { src ->
 - `DiffEngine`（L1 聚合 + L2 主键集合 + L3 行级）
 - `FieldRules` DSL（内置规则 + 自定义扩展函数）
 - `Check` 抽象 + `CheckRegistry`（连接配置由 Check 自己持有，框架不做兜底）
-- `Reporter`（Markdown + Webhook）
+- `Reporter`（Excel + Webhook）
 - CLI（Clikt）
 
 ### 5.7 验证点
@@ -532,7 +532,7 @@ S3/OSS：路径含 `s3://` / `oss://` 时自动 `INSTALL/LOAD httpfs`。
 
 | 连接器 | JDBC URL 前缀 | 关键参数 | 陷阱 |
 |:---|:---|:---|:---|
-| `ImpalaConnector` | `jdbc:impala://` | `autoCommit=false` + `fetchSize=10000` | Kerberos 票据需预先存在 |
+| `ImpalaConnector` | `jdbc:hive2://` | `autoCommit=false` + `fetchSize=10000` | Kerberos 票据需预先存在（hive-jdbc 驱动） |
 | `PgConnector` | `jdbc:postgresql://` | `autoCommit=false` + `fetchSize=10000` | 不关 autoCommit 会全量拉回 |
 | `MySQLConnector` | `jdbc:mysql://` | `autoCommit=false` + `fetchSize=10000` | `useCursorFetch=true` |
 | `MSSQLConnector` | `jdbc:sqlserver://` | `autoCommit=false` + `fetchSize=10000` | 默认全缓冲 |
@@ -590,7 +590,7 @@ object OrderSyncCheck : Check("order_sync") {
             }
         }
 
-        report.markdown("reports/order_sync.md", diff.summary())
+        report.excel("reports/order_sync.xlsx", diff.summary())
         if (diff.summary().hasDiff) report.webhook(env("ALERT_URL"), diff.summary())
     }
 }
@@ -699,7 +699,7 @@ sequenceDiagram
     Src-->>Engine: Row 流
     Tgt-->>Engine: Row 流
     Engine->>Reporter: DiffSummary
-    Reporter-->>CLI: Markdown 报告
+    Reporter-->>CLI: Excel 报告
     Reporter-->>CLI: Webhook 告警(可选)
 ```
 
@@ -715,7 +715,7 @@ sequenceDiagram
 | 上游阶段 1 | DuckDB JDBC 读 Parquet | duckdb_jdbc 1.5.5.1 |
 | 下游 | Impala Hive JDBC | ImpalaJDBC41 2.6.4 |
 | 上游阶段 2+ | 各源 JDBC 驱动 | — |
-| 报告 | Markdown / Webhook | JDK `HttpURLConnection`，无额外依赖 |
+| 报告 | Excel / Webhook | Excel 由 `XlsxWriter` 手写最小 OOXML（`java.util.zip`），零额外依赖；Webhook 用 JDK `HttpURLConnection` |
 | 调度 | Airflow / DolphinScheduler 触发 CLI | — |
 
 > Fat JAR 开了 `failOnDuplicateEntries = true` 严格模式：依赖树里出现重复条目直接构建失败。
@@ -768,7 +768,7 @@ sync_diff/
 │       │   │                 # ConnectorError / FieldRules(DSL) / SequenceExt
 │       │   ├── engine/       # DiffEngine（L1 聚合 / L2 主键集合 / L3 行级）
 │       │   ├── connectors/   # DuckDB文件: Parquet/Csv/Excel/Jsonl; JDBC: Impala/Pg/MySQL/MSSQL/ClickHouse/MaxCompute/H2; ResultSetExt
-│       │   └── reporter/     # Reporter（Markdown + Webhook）
+│       │   └── reporter/     # Reporter（Excel + Webhook）
 │       └── test/kotlin/com/kxxnzstdsw/sync_diff/    # 与 main 同构
 ├── checks/
 │   ├── build.gradle.kts

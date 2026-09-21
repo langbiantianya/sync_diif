@@ -56,18 +56,18 @@ class ImpalaConnectorTest {
 
     @Test
     fun `impala connector with bogus url fails fast at construction`() {
-        // 真实驱动加载后，无效 url 应该抛 SQLException —— 测试用的 url 形如 jdbc:impala://no-such-host:1
+        // 真实驱动加载后，无效 url 应该抛 SQLException —— 测试用的 url 形如 jdbc:hive2://no-such-host:1
         assertFailsWith<SQLException> {
-            ImpalaConnector("jdbc:impala://no-such-host.invalid:1", "u", "p", fetchSize = 100).use { /* nothing */ }
+            ImpalaConnector("jdbc:hive2://no-such-host.invalid:1", "u", "p", fetchSize = 100).use { /* nothing */ }
         }
     }
 
     @Test
     fun `ImpalaConfig fromEnv falls back to current when no env set`() {
         // 没设任何 env → 沿用 current 的全部字段。
-        val current = ImpalaConfig("jdbc:impala://current:21050", "cu", "cp")
+        val current = ImpalaConfig("jdbc:hive2://current:21050", "cu", "cp")
         val result = ImpalaConfig.fromEnv(current)
-        assertEquals("jdbc:impala://current:21050", result.jdbcUrl)
+        assertEquals("jdbc:hive2://current:21050", result.jdbcUrl)
         assertEquals("cu", result.user)
         assertEquals("cp", result.password)
     }
@@ -75,7 +75,7 @@ class ImpalaConnectorTest {
     @Test
     fun `ImpalaConfig fromEnv preserves user and password from current when env unset`() {
         // 没设 user/password env → 沿用 current。
-        val current = ImpalaConfig("jdbc:impala://current:21050", "cu", "cp")
+        val current = ImpalaConfig("jdbc:hive2://current:21050", "cu", "cp")
         val result = ImpalaConfig.fromEnv(current)
         assertEquals("cu", result.user)
         assertEquals("cp", result.password)

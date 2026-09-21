@@ -87,23 +87,23 @@ export ORDERS_TGT_PARQUET_PATH=/data/orders_tgt/dt=2026-09-20/part-0.parquet
 java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
 ```
 
-成功退出码 `0`，并在 `reports/order_sync_2026-09-20.md` 落一份报告。
-下面是按 §10 那份 fixture（源端 3 行；目标端缺 1 行 + 1 行金额漂移）跑出来的真实输出：
+成功退出码 `0`，并在 `reports/order_sync_2026-09-20.xlsx` 落一份 Excel 报告。
+下面是按 §10 那份 fixture（源端 3 行；目标端缺 1 行 + 1 行金额漂移）跑出来的内容：
+sheet 名与首行标题都来自 `heading("Diff Summary")`（同源），A 列是项、B 列是值。
 
-```markdown
-# Diff Summary
+| A | B | 落成 |
+|:---|:---|:---|
+| Diff Summary | | 加粗 13pt 标题，同时是该 sheet 的名字 |
+| metric | value | 加粗 + 灰底表头 |
+| level | WARN | `DiffLevel` 的 name（INFO / WARN / ERROR），文本单元格 |
+| src rows | 3 | 数字单元格 |
+| tgt rows | 2 | 数字单元格 |
+| diff keys | 3 | 数字单元格 |
+| hasDiff = true | | 一段文本；无差异时写 `hasDiff = false` |
+| Top diff keys are reported in the linked L3 detail file. | | 仅 `hasDiff == true` 时追加 |
 
-| metric | value |
-|:---|---:|
-| level | WARN |
-| src rows | 3 |
-| tgt rows | 2 |
-| diff keys | 3 |
-
-> hasDiff = true
-
-Top diff keys are reported in the linked L3 detail file.
-```
+`Diff Summary` 表只有这几行，没有 row-level 明细；差异明细、字段对照这类内容由 Check 自己
+追加（每个 `heading` 开一张 sheet），见 [§7](#7-报告与告警)。
 
 3 条差异分别是：L1 分区（count 3 ≠ 2）、L3 缺行（order_id=3）、L3 金额超容（order_id=2）。
 
@@ -137,7 +137,7 @@ java -jar app/build/libs/sync_diff-all.jar --check order_sync --alert-url "$ALER
 
 # 只靠环境变量：连接信息走 Check 自己的 env（IMPALA_URL / IMPALA_JDBC_URL / …），
 # 不再走 CLI 的 --impala-url；CLI 这一层只负责 --check / --dt / --alert-url。
-IMPALA_URL='jdbc:impala://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
+IMPALA_URL='jdbc:hive2://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
   java -jar app/build/libs/sync_diff-all.jar --check wilson_apply_detail_sync --dt 2026-09-20
 ```
 
@@ -201,7 +201,7 @@ object UserSyncCheck : CheckBase("user_sync") {
         val tgtAgg = tgt query "SELECT COUNT(*) AS c FROM ods.users WHERE dt = '$dt'"
 
         diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt"))
-        report.markdown("reports/user_sync_$dt.md", diff.summary())
+        report.excel("reports/user_sync_$dt.xlsx", diff.summary())
     }
 }
 ```
@@ -212,7 +212,7 @@ object UserSyncCheck : CheckBase("user_sync") {
 |:---|:---|:---|
 | `args` | `Check.Args`，由 `runWith` 注入 | CLI 从 `--dt` 造出来；`args.copy(dt = ...)` 派生新参数 |
 | `diff` | 本次执行的 `DiffEngine` | **每次执行新建**，所以并发跑同一 Check 不会共享计数器 |
-| `report` | 本次执行的 `Reporter` | Markdown + Webhook |
+| `report` | 本次执行的 `Reporter` | Excel（`heading` / `paragraph` / `bullets` / `table`）+ Webhook |
 
 **上游 / 下游连接信息由 Check 自己负责**——典型做法是给 Check 加一个
 `@Volatile var myCfg = ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)`，调度脚本改 env 切集群、
@@ -221,8 +221,9 @@ object UserSyncCheck : CheckBase("user_sync") {
 上下游 Connector 都直接 new，不走工厂封装——`ParquetConnector` / `ImpalaConnector` 就是
 同一套 `Connector` 接口的两个实现，Check 想在两侧用哪个就 new 哪个。
 
-`Ctx` 是**每次执行一个实例**（不是 `object`）。`DiffEngine` 带可变计数器、`Reporter` 不是
-线程安全的，做成单例会让并发执行互相污染，所以 `Check.runWith` 每次都 new 一个。
+`Ctx` 是**每次执行一个实例**（不是 `object`）。`DiffEngine` 带可变计数器，做成单例会让并发
+执行互相污染；`Reporter` 本身无状态可复用，但同样跟着 `Ctx` 每次 new 一个，所以
+`Check.runWith` 每次都 new 一份。
 
 ### 3.2 参数的取用
 
@@ -595,57 +596,84 @@ implementation("org.postgresql:postgresql:42.7.4")
 
 ## 7. 报告与告警
 
-### Markdown 报告
+### Excel 报告
 
-`report.markdown(path, summary)` 覆盖写文件、自动创建父目录、UTF-8。
-输出结构见 [§1](#1-快速开始)。
+`report.excel(path, summary)` 覆盖写文件、自动创建父目录；文件是 `.xlsx`（OOXML），
+IO 失败抛异常。工作簿内容用 `ExcelBuilder` 的 DSL 拼装，标准汇总块固定落在名为
+`Diff Summary` 的 sheet 上（sheet 名与首行标题同源），A 列是项、B 列是值：
 
-汇总块只有四行（level / src rows / tgt rows / diff keys），**没有 row-level 明细**。
-差异明细、字段对照、巡检结论这类自定义内容由 Check 自己追加——`markdown` 有三个重载：
+| A | B | 落成 |
+|:---|:---|:---|
+| Diff Summary | | 加粗 13pt 标题，同时是该 sheet 的名字 |
+| metric | value | 加粗 + 灰底表头 |
+| level | INFO / WARN / ERROR | `DiffLevel` 的 name，文本单元格 |
+| src rows | 数字 | 数字单元格 |
+| tgt rows | 数字 | 数字单元格 |
+| diff keys | 数字 | 数字单元格 |
+| hasDiff = true | | 一段文本；无差异时写 `hasDiff = false` |
+| Top diff keys are reported in the linked L3 detail file. | | 仅 `hasDiff == true` 时追加 |
+
+`Diff Summary` 表本身**没有 row-level 明细**。差异明细、字段对照、巡检结论这类自定义内容由
+Check 自己追加——`excel` 有三个重载：
 
 ```kotlin
-// ① 只有汇总块（等价于原来的写法）
-report.markdown("reports/order_sync_$dt.md", summary)
+// ① 只有标准汇总块
+report.excel("reports/order_sync_$dt.xlsx", summary)
 
-// ② 汇总块 + 自定义内容：块追加在汇总块之后
-report.markdown("reports/order_sync_$dt.md", summary) {
-    heading("差异明细（抽样）")                 // level 默认 2，即 `##`
+// ② 汇总块 + Check 追加的自定义内容（每个 heading 一张 sheet）
+report.excel("reports/order_sync_$dt.xlsx", summary) {
+    heading("差异明细（抽样）")
     table(
         headers = listOf("列", "主键", "src", "tgt"),
         rows = diffs.map { listOf(it.column, it.key, it.src, it.tgt) },
-        aligns = listOf(Align.LEFT, Align.LEFT, Align.RIGHT, Align.RIGHT),
     )
-    paragraph("> 只列抽样命中的差异，未命中不代表一致。")
+    paragraph("只列抽样命中的差异，未命中不代表一致。")
 }
 
-// ③ 完全自定义，不写汇总块（报告结构全由 Check 决定）
-report.markdown("reports/inspect_$dt.md") {
-    heading("巡检结果", level = 1)
+// ③ 完全自定义，不写汇总块（报告长什么样全由 Check 决定）
+report.excel("reports/inspect_$dt.xlsx") {
+    heading("巡检结果")
     bullets(listOf("分区齐全", "part 文件数与上游一致"))
 }
 ```
 
-`MarkdownBuilder` 的块方法：`heading(text, level = 2)` / `paragraph(text)` /
-`bullets(items)` / `table(headers, rows, aligns)` / `code(text, language = "")` /
-`raw(markdown)`；块之间自动隔一个空行，`toString()` 末尾恰好一个 `\n`。
-`paragraph` / `raw` 的内容**原样落笔**（可以写引用、链接、HTML），只有表格单元格会转义。
+`ExcelBuilder` 只有四个落笔入口，都返回 `this` 可链式调用：
 
-表格渲染由 `markdownTable(headers, rows, aligns)` 承担（`MarkdownBuilder.table` 就是它的
-落笔形式），规则：
+- `heading(text)`：**开一张新 sheet**，`text` 同时当 sheet 名与该 sheet 首行的加粗标题。
+  下一个 `heading` 再开一张；标题之前的内容落在默认 sheet 上，第一个 `heading` 会给这张
+  还没写过内容的默认 sheet 改名——所以「完全自定义」的报告不会留下空的 `Report` sheet。
+- `paragraph(text)`：一行说明文字。
+- `bullets(items: Iterable<String>)`：每条一行，行首加 `• `；空集合不产生任何行。
+- `table(headers: List<String>, rows: Iterable<Iterable<Any?>>)`：一行加粗表头 + 每个数据行一行。
 
-- 单元格 `null` 写成 `null`（不折叠成空串，好和「值是空串」区分）；其它值走 `toString()`。
-- `|` 转义为 `\|`，换行折叠成 `<br>`——不处理会把表格切碎。
-- `aligns` 缺省是全 `DEFAULT`；给了就必须与表头等长，行内列数不一致直接抛
-  `IllegalArgumentException`（宁可当场失败，也不产出错位表格）。
+`heading` 的 sheet 名会做清洗：`\ / * ? : [ ]` 换成空格，去掉首尾空格与单引号，清洗后为空
+则用 `Report`，与 Excel 保留名 `History` 同名（忽略大小写）时补下划线 `History_`，按码点
+截到 31 个字符（不切断代理对），重名（忽略大小写）自动加后缀 ` (2)`、` (3)`……
 
-需要「先拿字符串再决定写哪儿」（同一份内容既落盘又发 webhook）时，自己拼：
+`table` 的参数校验走 fail fast（`IllegalArgumentException`），不静默产出错位表格：
+`headers` 不能为空，每一行的列数必须等于表头列数。`excel(path){}` 传空 lambda 不报错，
+会落一张名为 `Report` 的空 sheet。
 
-```kotlin
-val md = MarkdownBuilder().apply {
-    heading("差异明细")
-    table(listOf("列", "src", "tgt"), rows)
-}
-```
+单元格取值规则（`table` / `paragraph` / `bullets` 共用）：
+
+- `null` → 文本 `null`（**不是空单元格**；对账报告里「没有值」与「值是空串」必须能区分）。
+- `Number` → 数字单元格（可在 Excel 里直接求和 / 排序）；`Boolean` → 布尔单元格；
+  其余（含 `String`）走 `toString()` 落成文本单元格。
+- `Double` / `Float` 的 NaN、Infinity → 退回文本（Excel 表示不了这两个值）。
+- `Long` / `BigDecimal` → 能精确表示时数字单元格；`Long` 超过 ±2^53、`BigDecimal` 超过
+  15 位有效数字时落成**文本**。checksum / `SUM(hash(...))` 常年是 64 位整数，直接写 double
+  会被静默四舍五入（`123456789012345678` → `123456789012345680`），宁可退化成文本也不改数。
+
+落盘由 `XlsxWriter` 手写**最小 OOXML**，只用 `java.util.zip` + 拼串，零额外依赖
+（不引 POI / xmlbeans / commons-* / log4j-api）。写出的部件只有 `[Content_Types].xml`、
+`_rels/.rels`、`xl/workbook.xml`、`xl/_rels/workbook.xml.rels`、`xl/styles.xml`、
+`xl/worksheets/sheetN.xml`；单元格一律 `t="inlineStr"`（不写 sharedStrings），没有主题 /
+docProps / 列宽 / 自动过滤 / 公式 / 图表，样式只有正文（顶对齐 + 自动换行）、标题（加粗
+13pt）、表头（加粗 + 灰底）三种。单元格文本超过 32767 字符（Excel 单格上限，超了整份工作簿
+会被判损坏）时截断并补 `...`；XML 1.0 非法控制字符、落单的代理项（unpaired surrogate）直接
+丢弃——一个畸形字符会毁掉整份工作簿，不值得为它保住那一格。写入是覆盖写、自动建父目录，
+父目录不存在 / 无权限 / 磁盘满照样抛 IO 异常（与 [webhook](#webhook)「任何 IO 异常都吞掉」
+相反）。
 
 ### Webhook
 
@@ -665,7 +693,7 @@ val md = MarkdownBuilder().apply {
 - 非 2xx 响应内部会抛 `IOException`，随后同样被吞掉。
 
 ```kotlin
-report.markdown("reports/order_sync_$dt.md", summary)
+report.excel("reports/order_sync_$dt.xlsx", summary)
 if (alertUrl.isNotEmpty()) report.webhook(alertUrl, summary)
 ```
 
@@ -699,19 +727,19 @@ CLI 不再做"前置装配"——`--impala-url` 已删除，连接信息走 Chec
 
 ```kotlin
 // 直接给字段赋值（@Volatile 写读并发安全）
-OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig("jdbc:impala://canary:21050", "etl", "secret"))
+OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig("jdbc:hive2://canary:21050", "etl", "secret"))
 
 // 或者重新 fromEnv 一次
 OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig.fromEnv())
 ```
 
-Impala JDBC URL 形态与三种认证：
+Impala JDBC URL 形态与三种认证（驱动：`org.apache.hive:hive-jdbc`，scheme `jdbc:hive2://`）：
 
 | 模式 | URL 关键参数 | 凭据 |
 |:---|:---|:---|
-| 无认证 | `AuthMech=0` | 不需要 |
-| LDAP | `AuthMech=3` | 可写进 URL，或走 `user` / `password` |
-| Kerberos | `AuthMech=1`, `KrbRealm`, `KrbHostFQDN`, `KrbServiceName` | 票据由 JVM 从 ticket cache 取，`user` / `password` 留空 |
+| 无认证 | 无（默认） | 不需要 |
+| LDAP | `auth=LDAP` | 可写进 URL，或走 `user` / `password` |
+| Kerberos | `principal=hive/_HOST@REALM` | 票据由 JVM 从 ticket cache 取，`user` / `password` 留空 |
 
 ---
 
@@ -735,7 +763,7 @@ run_diff = BashOperator(
     ),
     env={
         # 连接信息走 Check 自己持有的字段；env 只放切换集群 / 凭据时要覆盖的值。
-        "IMPALA_JDBC_URL": "jdbc:impala://impala-prod:21050/default;AuthMech=0",
+        "IMPALA_JDBC_URL": "jdbc:hive2://impala-prod:21050/default",
         "ORDERS_PARQUET_PATH": "/data/orders/dt={{ ds }}/part-0.parquet",
         "ORDERS_TGT_PARQUET_PATH": "/data/orders_tgt/dt={{ ds }}/part-0.parquet",
         "ALERT_URL": "{{ var.value.diff_alert_url }}",
@@ -806,7 +834,7 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 | | `.../engine/DiffEngineTest.kt` | 三档 diff、计数器、`keySet` 去重与扫描次数 |
 | | `.../connectors/ParquetConnectorTest.kt` | DuckDB 读写、类型归一、`guard` 契约 |
 | | `.../connectors/ImpalaConnectorTest.kt` | 接口形状、`ImpalaConfig.fromEnv`、连不上时 fail fast |
-| | `.../reporter/ReporterTest.kt` | Markdown / JSON / webhook |
+| | `.../reporter/ReporterTest.kt` | 手写 OOXML 写出的 `.xlsx` 用 POI（仅测试期依赖）读回校验 + webhook JSON |
 | `checks`（31） | `checks/src/test/kotlin/.../check/CheckTest.kt` | Args 注入 |
 | | `.../check/CheckRegistryTest.kt` | 注册、查重、`discover` |
 | | `.../checks/OrderSyncCheckEndToEndTest.kt` | 端到端（DuckDB 造数 → 跑 Check → 断言 Summary） |

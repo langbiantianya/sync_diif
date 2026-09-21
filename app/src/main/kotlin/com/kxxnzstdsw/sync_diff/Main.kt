@@ -53,7 +53,7 @@ import kotlinx.coroutines.runBlocking
  *
  * # 4) 下游连接信息走 Check 自己的 env/字段（CLI 不再兜底）：要切 Impala 集群就改 Check
  * #    实现里读的 env（Wilson 域默认读 `IMPALA_URL` / `IMPALA_USER` / `IMPALA_PASSWORD`）。
- * IMPALA_URL='jdbc:impala://impala-prod:21050/default' \
+ * IMPALA_URL='jdbc:hive2://impala-prod:21050/default' \
  * ALERT_URL='https://hooks.example.com/sync-diff' \
  *     java -jar build/libs/sync_diff-all.jar --check wilson_apply_detail_sync
  * ```

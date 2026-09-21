@@ -54,7 +54,7 @@ import java.sql.DriverManager
  */
 class ParquetConnector(
     private val path: String,
-    private val memoryLimit: String = "4GB",
+    private val memoryLimit: String = "1GB",
     private val tempDir: String = "/tmp/duckdb_spill",
 ) : Connector {
 
