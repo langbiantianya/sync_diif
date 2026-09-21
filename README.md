@@ -9,9 +9,8 @@
 
 - **上下游同一套 Connector**：上游接 Parquet 用 `ParquetConnector`，下游接 Impala 用
   `ImpalaConnector`；Check 在 `Ctx.run()` 里直接 new 对应 Connector，不经过任何工厂封装。
-  上游 / 下游接什么、用什么配置全在 Check 自己手里——`WilsonActivity*Check` 声明走
-  Parquet + Impala，`OrderSyncCheck` 声明双 Parquet，再写一个 Check 想换源就直接
-  `IcebergRESTConnector(...)` / `PostgresConnector(...)`。
+  上游 / 下游接什么、用什么配置全在 Check 自己手里——`OrderSyncCheck` 声明双
+  Parquet + Impala，再写一个 Check 想换源就直接 `IcebergRESTConnector(...)` / `PostgresConnector(...)`。
 - **上游按需**：遇到一个源接一个。阶段 1 先接 Parquet（用 DuckDB 读），后续 JDBC 源逐个补齐。
 - **新增源零侵入**：加一个实现 `Connector` 的类即可，Check 里直接用它，不动任何已有代码。
 - **代码即配置**：`Check` 对象直接写 SQL 与规则，不引入 Capabilities、PushdownPlanner 之类的元数据层。
@@ -753,7 +752,7 @@ Gradle 多模块，依赖方向单向：`app → checks → core`。
 | 模块 | 职责 | 主要依赖 |
 |:---|:---|:---|
 | `core` | 对账内核：Row / DiffEngine / Connector / FieldRules / Reporter | Kotlin、协程、DuckDB JDBC、Impala JDBC |
-| `checks` | Check 抽象与注册表 + 具体对账（`OrderSyncCheck`、`WilsonActivity*Check`） | `core`、kotlin-reflect |
+| `checks` | Check 抽象与注册表 + 具体对账（`OrderSyncCheck`） | `core`、kotlin-reflect |
 | `app` | CLI 入口 + Shadow Fat JAR（可执行产物） | `checks`、`core`、Clikt |
 
 ```
@@ -803,5 +802,4 @@ java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
 
 上游路径由 `ORDERS_PARQUET_PATH` / `ORDERS_TGT_PARQUET_PATH` 控制（`OrderSyncCheck` 阶段 1
 两端都走 Parquet 以便零依赖自测；生产要把下游换成 Impala，去 `OrderSyncCheck.defaultConnectors()`
-里替换 Connector、或在 `OrderSyncCheck.injected` 上注入一对目标 Connector）。Wilson 域的两个
-Check 直接以 `IMPALA_URL` / `IMPALA_JDBC_URL` / `IMPALA_USER` / `IMPALA_PASSWORD` 兜底。
+里替换 Connector、或在 `OrderSyncCheck.injected` 上注入一对目标 Connector）。
