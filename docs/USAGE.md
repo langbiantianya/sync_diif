@@ -27,7 +27,7 @@ Gradle 多模块，依赖方向单向 `app → checks → core`：
 | 模块 | 职责 | 源码目录 |
 |:---|:---|:---|
 | `core` | 对账内核：`Row` / `DiffEngine` / `Connector` / `FieldRules` / `Reporter` | `core/src/main/kotlin` |
-| `checks` | `Check` 抽象与注册表 + 具体对账（`OrderSyncCheck`、`WilsonActivity*Check`） | `checks/src/main/kotlin` |
+| `checks` | `Check` 抽象与注册表 + 具体对账（`OrderSyncCheck`） | `checks/src/main/kotlin` |
 | `app` | CLI 入口 + Shadow Fat JAR | `app/src/main/kotlin` |
 
 改代码前先对号入座：新增**数据源**动 `core`，新增**一条对账**动 `checks`，
@@ -644,45 +644,8 @@ report.markdown("reports/inspect_$dt.md") {
 val md = MarkdownBuilder().apply {
     heading("差异明细")
     table(listOf("列", "src", "tgt"), rows)
-}.toString()
+}
 ```
-
-### 内置 Wilson Check 的明细表
-
-`wilson_apply_detail_sync` / `wilson_event_header_sync` 的报告 = 标准汇总块 + 两张抽样明细表。
-数据来自 `WilsonActivityCheckBase.Result`（`columnSamples` / `pkSamples`），**与汇总同源**：
-判定用的就是这一批样本，不是为写报告再查一遍库，所以表格行数与 `summary.diffCount` 必定对得上。
-
-| 小节 | 一行是什么 | 列 |
-|:---|:---|:---|
-| `## 单字段抽样（N 列，差异 M 列）` | `columns` 每一列（跳过主键列）取一条**上游非空样本**，再按主键反查下游同一行 | 列 / 主键 / src / tgt / 结论 |
-| `## 主键随机抽样（N 条，下游缺失 M 条）` | 本次抽到的每条上游主键（`ORDER BY hash(pk) LIMIT sampleSize`，默认 100） | 主键 / src / tgt / 结论 |
-
-结论只有四种：`一致` / `值不同` / `下游缺该行` / `上游该列全空`（上游整列没有非空值时，主键一栏写 `-`）。
-`sampleSize`（默认 100，实例字段）控制主键抽样条数：上游不足 100 行就抽多少写多少；上游空表时
-该小节整段不出现。单元格里的 `null` 是真实空值，和空串不是一回事。
-
-真实报告节选（`wilson_apply_detail_sync`，10 行 fixture、`code` 列故意漂移）：
-
-```markdown
-## 单字段抽样（48 列，差异 1 列）
-
-| 列 | 主键 | src | tgt | 结论 |
-|---|---|---|---|---|
-| code | 1 | code-1 | TGT-CODE | 值不同 |
-| status_name | 1 | status_name-1 | status_name-1 | 一致 |
-
-## 主键随机抽样（10 条，下游缺失 0 条）
-
-| 主键 | src | tgt | 结论 |
-|:---|:---:|:---:|:---|
-| 1 | 有 | 有 | 一致 |
-| 2 | 有 | 有 | 一致 |
-```
-
-细节：整张表按上游样本的主键取值排序无关紧要（抽样本身是 `hash` 伪随机），要 `ORDER BY` 的话
-在 `WilsonActivityCheckBase` 的 SQL 模板里改；报告文件名是 `reports/<reportFilename>_<dt>.md`，
-`reportFilename` 现在对子类公开，外部也能算出落盘位置。
 
 ### Webhook
 
@@ -728,10 +691,6 @@ CLI 不再做"前置装配"——`--impala-url` 已删除，连接信息走 Chec
 | `ALERT_URL` | 告警 webhook（CLI `--alert-url` 的同名 env） | CLI |
 | `ORDERS_PARQUET_PATH` | 内置 `order_sync` 的源端 parquet 路径 | `OrderSyncCheck` |
 | `ORDERS_TGT_PARQUET_PATH` | 内置 `order_sync` 的目标端 parquet 路径 | `OrderSyncCheck` |
-| `WILSON_APPLY_DETAIL_PARQUET_PATH` | 内置 `wilson_apply_detail_sync` 的源端 parquet 路径 | `WilsonActivityApplyDetailCheck` |
-| `WILSON_APPLY_DETAIL_TGT_TABLE` | 内置 `wilson_apply_detail_sync` 的下游 Impala 表名；未设则 `dwd.fact_channel_wilson_activity_apply_detail` | `WilsonActivityApplyDetailCheck` |
-| `WILSON_EVENT_HEADER_PARQUET_PATH` | 内置 `wilson_event_header_sync` 的源端 parquet 路径 | `WilsonActivityEventHeaderCheck` |
-| `WILSON_EVENT_HEADER_TGT_TABLE` | 内置 `wilson_event_header_sync` 的下游 Impala 表名；未设则 `dwd.fact_channel_wilson_activity_event_header` | `WilsonActivityEventHeaderCheck` |
 
 优先级：env > Check 字段当前值。Check 之间互不影响——一个 Check 改自己的 `cfg` 不会
 牵动别的 Check；改 env 则所有读到该 env 的 Check 一起生效（看各 Check `fromEnv` 实现）。
@@ -740,12 +699,10 @@ CLI 不再做"前置装配"——`--impala-url` 已删除，连接信息走 Chec
 
 ```kotlin
 // 直接给字段赋值（@Volatile 写读并发安全）
-WilsonActivityApplyDetailCheck.tgtImpalaConfig =
-    ImpalaConfig("jdbc:impala://canary:21050", "etl", "secret")
+OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig("jdbc:impala://canary:21050", "etl", "secret"))
 
 // 或者重新 fromEnv 一次
-WilsonActivityApplyDetailCheck.tgtImpalaConfig =
-    ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT).copy(jdbcUrl = "jdbc:impala://canary:21050")
+OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig.fromEnv())
 ```
 
 Impala JDBC URL 形态与三种认证：
@@ -853,7 +810,6 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 | `checks`（31） | `checks/src/test/kotlin/.../check/CheckTest.kt` | Args 注入 |
 | | `.../check/CheckRegistryTest.kt` | 注册、查重、`discover` |
 | | `.../checks/OrderSyncCheckEndToEndTest.kt` | 端到端（DuckDB 造数 → 跑 Check → 断言 Summary） |
-| | `.../checks/WilsonActivity*EndToEndTest.kt` | 两张 Wilson 表的端到端（列抽样 / 主键抽样 / 报告） |
 | `app`（0） | — | CLI 目前靠手工冒烟（见 §2） |
 
 ---
