@@ -26,8 +26,8 @@ Gradle 多模块，依赖方向单向 `app → checks → core`：
 
 | 模块 | 职责 | 源码目录 |
 |:---|:---|:---|
-| `core` | 对账内核：`Row` / `DiffEngine` / `Connector` / `FieldRules` / `Reporter` / 配置工厂 | `core/src/main/kotlin` |
-| `checks` | `Check` 抽象与注册表 + 具体对账（`OrderSyncCheck`） | `checks/src/main/kotlin` |
+| `core` | 对账内核：`Row` / `DiffEngine` / `Connector` / `FieldRules` / `Reporter` | `core/src/main/kotlin` |
+| `checks` | `Check` 抽象与注册表 + 具体对账（`OrderSyncCheck`、`WilsonActivity*Check`） | `checks/src/main/kotlin` |
 | `app` | CLI 入口 + Shadow Fat JAR | `app/src/main/kotlin` |
 
 改代码前先对号入座：新增**数据源**动 `core`，新增**一条对账**动 `checks`，
@@ -117,7 +117,6 @@ Top diff keys are reported in the linked L3 detail file.
 |:---|:---:|:---|:---|:---|
 | `--check` | ✅ | — | — | 要跑的 Check 名（区分大小写），与 `Check.name` 对齐 |
 | `--dt` | | `1970-01-01` | — | 上游分区日，装进 `Check.Args.dt` |
-| `--impala-url` | | `jdbc:impala://localhost:21050` | `IMPALA_URL` | 下游 Impala JDBC URL |
 | `--alert-url` | | 空（不发告警） | `ALERT_URL` | 告警 webhook；只有实现 `Alertable` 的 Check 会收到 |
 | `--registry` | | `checks.txt` | — | Check 注册清单文件路径 |
 | `-h`, `--help` | | — | — | 打印用法 |
@@ -136,9 +135,10 @@ java -jar app/build/libs/sync_diff-all.jar --check order_sync --registry conf/ch
 # 带告警地址
 java -jar app/build/libs/sync_diff-all.jar --check order_sync --alert-url "$ALERT_URL"
 
-# 只靠环境变量（命令行不传 --impala-url / --alert-url）
+# 只靠环境变量：连接信息走 Check 自己的 env（IMPALA_URL / IMPALA_JDBC_URL / …），
+# 不再走 CLI 的 --impala-url；CLI 这一层只负责 --check / --dt / --alert-url。
 IMPALA_URL='jdbc:impala://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
-  java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
+  java -jar app/build/libs/sync_diff-all.jar --check wilson_apply_detail_sync --dt 2026-09-20
 ```
 
 ### 退出码与失败行为
@@ -187,12 +187,14 @@ package com.example.checks
 
 import com.kxxnzstdsw.sync_diff.check.CheckBase
 import com.kxxnzstdsw.sync_diff.check.Ctx
+import com.kxxnzstdsw.sync_diff.connectors.ImpalaConnector
+import com.kxxnzstdsw.sync_diff.connectors.ParquetConnector
 
 object UserSyncCheck : CheckBase("user_sync") {
     override suspend fun Ctx.run() {
         val dt = args.dt
-        val src = source parquet "/data/users/dt=$dt/part-0.parquet"   // 上游工厂
-        val tgt = target impala "ods.users"                            // 下游工厂
+        val src = ParquetConnector("/data/users/dt=$dt/part-0.parquet")        // 上游 Connector
+        val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)) // 下游 Connector
 
         val sql = "SELECT COUNT(*) AS c FROM read_parquet('/data/users/dt=$dt/part-0.parquet')"
         val srcAgg = src query sql
@@ -209,9 +211,15 @@ object UserSyncCheck : CheckBase("user_sync") {
 | 名字 | 来源 | 说明 |
 |:---|:---|:---|
 | `args` | `Check.Args`，由 `runWith` 注入 | CLI 从 `--dt` 造出来；`args.copy(dt = ...)` 派生新参数 |
-| `source` / `target` | `Check` 的工厂属性，读 `GlobalConfig.current` | 造 Connector；谁造谁 `use { }` 关 |
 | `diff` | 本次执行的 `DiffEngine` | **每次执行新建**，所以并发跑同一 Check 不会共享计数器 |
 | `report` | 本次执行的 `Reporter` | Markdown + Webhook |
+
+**上游 / 下游连接信息由 Check 自己负责**——典型做法是给 Check 加一个
+`@Volatile var myCfg = ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)`，调度脚本改 env 切集群、
+测试改字段都行。框架没有"全局默认下游"。
+
+上下游 Connector 都直接 new，不走工厂封装——`ParquetConnector` / `ImpalaConnector` 就是
+同一套 `Connector` 接口的两个实现，Check 想在两侧用哪个就 new 哪个。
 
 `Ctx` 是**每次执行一个实例**（不是 `object`）。`DiffEngine` 带可变计数器、`Reporter` 不是
 线程安全的，做成单例会让并发执行互相污染，所以 `Check.runWith` 每次都 new 一个。
@@ -231,16 +239,25 @@ val yesterday = args.copy(dt = "2026-09-19")             // 派生，不改原�
 ### 3.3 接 Impala（阶段 2+ 的上游也一样）
 
 ```kotlin
+@Volatile var impalaCfg: ImpalaConfig = ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)
+
 override suspend fun Ctx.run() {
-    val src = source parquet "/data/orders/dt=${args.dt}/part-0.parquet"
-    val tgt = target impala "ods.orders"
+    val src = ParquetConnector("/data/orders/dt=${args.dt}/part-0.parquet")
+    val tgt = ImpalaConnector(impalaCfg)             // 生产：连 Impala
 
     // 两侧 SQL 各写自己的方言，Connector 负责把结果归一成 Row
 }
 ```
 
-`Connector.query/stream/one` 收的是**完整 SQL**，表名必须自己写全限定——
-`target impala "ods.orders"` 的参数目前只用于对齐工厂签名（见 §12）。
+`Connector.query/stream/one` 收的是**完整 SQL**，表名必须自己写全限定；Connector 构造参数
+（如 `ParquetConnector` 的 `path`）只用于判断是否加载 `httpfs` / 配 DuckDB 内存上限，
+**真正读哪些文件由 SQL 里的 `read_parquet('...')` 决定**。
+
+下游也能直接读 Parquet（同一套 `ParquetConnector`，与上游对称）——CI / 自测场景：
+
+```kotlin
+val tgt = ParquetConnector("/tmp/tgt.parquet")         // 自测：直接读本地 parquet
+```
 
 ### 3.4 让 CLI 找到它
 
@@ -466,7 +483,7 @@ diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt")) {
 
 ## 6. 新增一个上游数据源
 
-设计目标是**零侵入**：加一个 `Connector` 类 + 工厂一行方法，不动已有代码。
+设计目标是**零侵入**：加一个实现 `Connector` 的类，Check 里直接 `new` 它，不动已有代码。
 
 ### 步骤
 
@@ -523,16 +540,18 @@ class PostgresConnector(dsn: String, private val fetchSize: Int = 10_000) : Conn
 以上文件放在 `core` 模块：
 `core/src/main/kotlin/com/kxxnzstdsw/sync_diff/connectors/PostgresConnector.kt`。
 
-**2) 加工厂方法**
+**2) 直接 new 它**（没有工厂层要改）
 
 ```kotlin
-// core/src/main/kotlin/com/kxxnzstdsw/sync_diff/config/Config.kt
-class Sources(private val cfg: AppConfig) {
-    fun parquet(path: String, memoryLimit: String = "4GB") = ParquetConnector(path, memoryLimit)
-    fun impala(table: String) = ImpalaConnector(cfg.impala.jdbcUrl, cfg.impala.user, cfg.impala.password)
-    fun postgres(dsn: String) = PostgresConnector(dsn)      // ← 新增一行
+override suspend fun Ctx.run() {
+    val src = PostgresConnector("jdbc:postgresql://host:5432/orders")   // ← 新增一个 Connector
+    val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))
+    // ...
 }
 ```
+
+不需要往任何工厂类里加方法：`Connector` 是唯一抽象，Check 想用哪个源就 new 哪个。
+上游、下游、同一条 Check 里多个源，全都是同一套写法。
 
 **3) 加驱动依赖**（`core/build.gradle.kts`，不是根目录——根目录没有 build 文件）
 
@@ -695,14 +714,17 @@ if (alertUrl.isNotEmpty()) report.webhook(alertUrl, summary)
 
 ## 8. 配置与环境变量
 
+CLI 不再做"前置装配"——`--impala-url` 已删除，连接信息走 Check 自己持有的字段
+（典型：`@Volatile var cfg = ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)`），env 兜底在
+`ImpalaConfig.fromEnv` 里完成。
+
 ### 变量表
 
 | 变量 | 作用 | 用在 |
 |:---|:---|:---|
-| `IMPALA_URL` | 下游 Impala JDBC URL（CLI `--impala-url` 的同名 env） | CLI |
-| `IMPALA_JDBC_URL` | 同上，但优先级低于 `--impala-url` | `GlobalConfig.loadFromEnv()` |
-| `IMPALA_USER` | Impala 用户名（LDAP） | `GlobalConfig.loadFromEnv()` |
-| `IMPALA_PASSWORD` | Impala 口令 | `GlobalConfig.loadFromEnv()` |
+| `IMPALA_JDBC_URL` | 下游 Impala JDBC URL（Wilson 域 Check 默认读） | `ImpalaConfig.fromEnv` |
+| `IMPALA_USER` | Impala 用户名（LDAP） | `ImpalaConfig.fromEnv` |
+| `IMPALA_PASSWORD` | Impala 口令 | `ImpalaConfig.fromEnv` |
 | `ALERT_URL` | 告警 webhook（CLI `--alert-url` 的同名 env） | CLI |
 | `ORDERS_PARQUET_PATH` | 内置 `order_sync` 的源端 parquet 路径 | `OrderSyncCheck` |
 | `ORDERS_TGT_PARQUET_PATH` | 内置 `order_sync` 的目标端 parquet 路径 | `OrderSyncCheck` |
@@ -711,20 +733,20 @@ if (alertUrl.isNotEmpty()) report.webhook(alertUrl, summary)
 | `WILSON_EVENT_HEADER_PARQUET_PATH` | 内置 `wilson_event_header_sync` 的源端 parquet 路径 | `WilsonActivityEventHeaderCheck` |
 | `WILSON_EVENT_HEADER_TGT_TABLE` | 内置 `wilson_event_header_sync` 的下游 Impala 表名；未设则 `dwd.fact_channel_wilson_activity_event_header` | `WilsonActivityEventHeaderCheck` |
 
-优先级：显式参数（命令行）> 同名环境变量 > 代码里的当前值。
+优先级：env > Check 字段当前值。Check 之间互不影响——一个 Check 改自己的 `cfg` 不会
+牵动别的 Check；改 env 则所有读到该 env 的 Check 一起生效（看各 Check `fromEnv` 实现）。
 
-> CLI 路径上 `--impala-url` 有非空默认值，所以 `IMPALA_JDBC_URL` 在 CLI 里不会是兜底；
-> 换地址请用 `--impala-url` 或 `IMPALA_URL`。
-
-### 代码里改配置
+### 代码里改连接配置
 
 ```kotlin
-GlobalConfig.loadFromEnv()                                  // 只读 env
-GlobalConfig.loadFromEnv(impalaUrl = "jdbc:impala://x:21050")  // 显式覆盖
-GlobalConfig.configure(AppConfig(ImpalaConfig("jdbc:impala://y:21050", "u", "p")))  // 测试直接替换
-```
+// 直接给字段赋值（@Volatile 写读并发安全）
+WilsonActivityApplyDetailCheck.tgtImpalaConfig =
+    ImpalaConfig("jdbc:impala://canary:21050", "etl", "secret")
 
-`GlobalConfig.current` 的 setter 是 `private`，运行期改配置走 `configure` / `loadFromEnv`。
+// 或者重新 fromEnv 一次
+WilsonActivityApplyDetailCheck.tgtImpalaConfig =
+    ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT).copy(jdbcUrl = "jdbc:impala://canary:21050")
+```
 
 Impala JDBC URL 形态与三种认证：
 
@@ -755,7 +777,8 @@ run_diff = BashOperator(
         "--registry /opt/sync_diff/conf/checks.txt"
     ),
     env={
-        "IMPALA_URL": "jdbc:impala://impala-prod:21050/default;AuthMech=0",
+        # 连接信息走 Check 自己持有的字段；env 只放切换集群 / 凭据时要覆盖的值。
+        "IMPALA_JDBC_URL": "jdbc:impala://impala-prod:21050/default;AuthMech=0",
         "ORDERS_PARQUET_PATH": "/data/orders/dt={{ ds }}/part-0.parquet",
         "ORDERS_TGT_PARQUET_PATH": "/data/orders_tgt/dt={{ ds }}/part-0.parquet",
         "ALERT_URL": "{{ var.value.diff_alert_url }}",
@@ -822,17 +845,16 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 
 | 模块 | 用例文件 | 覆盖 |
 |:---|:---|:---|
-| `core`（58） | `core/src/test/kotlin/.../core/CoreTypesTest.kt` | Row 扩展、FieldRules 两种写法、DiffSummary |
+| `core`（66） | `core/src/test/kotlin/.../core/CoreTypesTest.kt` | Row 扩展、FieldRules 两种写法、DiffSummary |
 | | `.../engine/DiffEngineTest.kt` | 三档 diff、计数器、`keySet` 去重与扫描次数 |
 | | `.../connectors/ParquetConnectorTest.kt` | DuckDB 读写、类型归一、`guard` 契约 |
-| | `.../connectors/ImpalaConnectorTest.kt` | 接口形状、连不上时 fail fast |
+| | `.../connectors/ImpalaConnectorTest.kt` | 接口形状、`ImpalaConfig.fromEnv`、连不上时 fail fast |
 | | `.../reporter/ReporterTest.kt` | Markdown / JSON / webhook |
-| `checks`（20） | `checks/src/test/java/.../check/CheckTest.kt` | Args 注入、工厂 |
+| `checks`（31） | `checks/src/test/kotlin/.../check/CheckTest.kt` | Args 注入 |
 | | `.../check/CheckRegistryTest.kt` | 注册、查重、`discover` |
 | | `.../checks/OrderSyncCheckEndToEndTest.kt` | 端到端（DuckDB 造数 → 跑 Check → 断言 Summary） |
+| | `.../checks/WilsonActivity*EndToEndTest.kt` | 两张 Wilson 表的端到端（列抽样 / 主键抽样 / 报告） |
 | `app`（0） | — | CLI 目前靠手工冒烟（见 §2） |
-
-注意两个模块的测试目录约定不同：`core` 用 `src/test/kotlin`，`checks` 用 `src/test/java`。
 
 ---
 
@@ -862,18 +884,15 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 
 踩之前先知道：
 
-1. **`sources.impala(table)` / `targets.impala(table)` 的 `table` 参数当前未被使用。**
-   `Connector.query/stream` 收完整 SQL，表名必须由调用方写全限定。该参数只为对齐
-   README §8 的工厂签名而保留，改动它会破坏既有 Check。
-2. **`summary()` 最高只到 WARN**，无法区分 Mismatch 与 Missing；需要 ERROR 档请自行用
+1. **`summary()` 最高只到 WARN**，无法区分 Mismatch 与 Missing；需要 ERROR 档请自行用
    `DiffSummary.accumulate` 折算。
-3. **`ImpalaConnector` 没有对真实 Impala 的集成测试**（无可用实例）。连接参数与游标设置
+2. **`ImpalaConnector` 没有对真实 Impala 的集成测试**（无可用实例）。连接参数与游标设置
    按 README §6 实现，上线前请用真实 Impala 回归一次。
-4. **`OrderSyncCheck` 的 L1 checksum 用 DuckDB 的 `hash()`**，是方言函数；目标端换成
+3. **`OrderSyncCheck` 的 L1 checksum 用 DuckDB 的 `hash()`**，是方言函数；目标端换成
    Impala 时要改成 `fnv_hash()` 之类的等价函数，否则 checksum 列必然不平。
-5. **`OrderSyncCheck` 阶段 1 默认两端都走 Parquet**，便于零依赖自测；生产要把下游换成
+4. **`OrderSyncCheck` 阶段 1 默认两端都走 Parquet**，便于零依赖自测；生产要把下游换成
    Impala，见 `defaultConnectors()` 或注入 `injected`。
-6. **SQL 是字符串拼接的**（示例级别）。生产的动态值必须参数化或经白名单校验，否则有注入
+5. **SQL 是字符串拼接的**（示例级别）。生产的动态值必须参数化或经白名单校验，否则有注入
    风险——README §15 已列为中风险项。
-7. **`DiffEngine` 不是线程安全的**：一个 Check 一次执行一个实例。要在同一个 Check 里并发
+6. **`DiffEngine` 不是线程安全的**：一个 Check 一次执行一个实例。要在同一个 Check 里并发
    跑多档 diff，用 `Ctx.diff` 之外自己 new 的实例。

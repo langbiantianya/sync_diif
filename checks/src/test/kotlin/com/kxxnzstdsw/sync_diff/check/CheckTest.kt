@@ -27,14 +27,6 @@ class CheckTest {
     }
 
     @Test
-    fun `check source and target factories construct from GlobalConfig`() {
-        val src = ArgsCaptureCheck.source
-        val tgt = ArgsCaptureCheck.target
-        assertNotNull(src)
-        assertNotNull(tgt)
-    }
-
-    @Test
     fun `runWith injects Args into Ctx before run`() {
         val args = Args(dt = "2026-09-20", params = mapOf("k" to "v"))
         lastCaptured = null

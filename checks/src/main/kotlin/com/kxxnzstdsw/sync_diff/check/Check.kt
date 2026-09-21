@@ -1,9 +1,5 @@
 package com.kxxnzstdsw.sync_diff.check
 
-import com.kxxnzstdsw.sync_diff.config.AppConfig
-import com.kxxnzstdsw.sync_diff.config.GlobalConfig
-import com.kxxnzstdsw.sync_diff.config.Sources
-import com.kxxnzstdsw.sync_diff.config.Targets
 import com.kxxnzstdsw.sync_diff.engine.DiffEngine
 import com.kxxnzstdsw.sync_diff.reporter.Reporter
 import kotlinx.datetime.LocalDate.Companion.Format
@@ -19,13 +15,13 @@ import java.time.LocalDate
  * ```kotlin
  * object OrderSyncCheck : CheckBase("order_sync") {
  *     override suspend fun Ctx.run() {
- *         val dt = args.dt                                             // ① 本次运行参数
- *         val src = source parquet "/data/orders/dt=$dt/part-0.parquet" // ② 上游工厂
- *         val tgt = target impala "ods.orders"                         // ③ 下游工厂
+ *         val dt = args.dt                                                     // ① 本次运行参数
+ *         val src = ParquetConnector("/data/orders/dt=$dt/part-0.parquet")     // ② 上游 Connector
+ *         val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))  // ③ 下游 Connector
  *
  *         val sql = "SELECT COUNT(*) AS c FROM read_parquet('/data/orders/dt=$dt/part-0.parquet')"
- *         diff.aggregate(src query sql, tgt query sql, keys = listOf("dt"))  // ④ 本次执行
- *         report.markdown("reports/order_sync.md", diff.summary())           // ⑤ 本次执行
+ *         diff.aggregate(src query sql, tgt query sql, keys = listOf("dt"))    // ④ 本次执行
+ *         report.markdown("reports/order_sync.md", diff.summary())             // ⑤ 本次执行
  *     }
  * }
  * ```
@@ -36,11 +32,14 @@ import java.time.LocalDate
  * 斜杠也会提前闭合注释。
  * 五处引用各自的来源：
  * - ① `args`：[Ctx.args]，由 [runWith] 注入；CLI 从 `--dt` 构造 [Args]。
- * - ② `source` / ③ `target`：[source] / [target] 两个工厂属性，读 [checkConfig]
- *   （默认 [GlobalConfig.current]；测试里 `GlobalConfig.configure(...)` 换掉即可改指向）。
+ * - ② / ③ `src` / `tgt`：直接 new 对应 Connector。**框架不再给下游兜底**——
+ *   每个 Check 自己在实现里写明上游 / 下游要连什么、用什么配置（典型做法：把
+ *   `ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)` 当起点、需要换地址直接给字段赋值）。
+ *   造出来的 Connector 是 `Closeable`，谁造谁负责 `use { }` 关闭。
  * - ④ `diff` / ⑤ `report`：[Ctx.diff] / [Ctx.report]，**每次执行新建**，见下。
  *
- * `tgt` 侧把 SQL 换成 Impala 方言即可，其余写法不变（两侧 SQL 各自指向自己的数据源）。
+ * `tgt` 侧把 SQL 换成下游方言即可（Impala 方言 / PG 方言 / …），其余写法不变
+ * （两侧 SQL 各自指向自己的数据源）。
  * 模板里的 `c` 是计数，精确比即可；一旦 L1 带上 `SUM(...)` 这类浮点聚合列，
  * 就该给 [DiffEngine.aggregate] 传 `rules` 挂容忍度，否则行级容忍的漂移会在聚合层被误报。
  *
@@ -56,15 +55,6 @@ sealed interface Check {
 
     /** 默认空参数；具体 Check 可以 override 出带配置字段的 `args`。 */
     val args: Args get() = Args()
-
-    /** 默认走 [GlobalConfig.current]；测试里用 `GlobalConfig.configure(...)` 整体替换。 */
-    val checkConfig: AppConfig get() = GlobalConfig.current
-
-    /** 工厂入口：上游侧 [Sources]。 */
-    val source: Sources get() = Sources(checkConfig)
-
-    /** 工厂入口：下游侧 [Targets]。 */
-    val target: Targets get() = Targets(checkConfig)
 
     /** Check 主体。实现方在 [Ctx] 的 receiver 作用域里写业务逻辑。 */
     suspend fun Ctx.run()
@@ -132,8 +122,7 @@ class Ctx(
  * 简化版 [Check]：具体 Check 只需要 `object Foo : CheckBase("foo")` 就能开写。
  *
  * 它把 [Check] 收窄成「构造函数传名字 + 只实现 [Check.run]」的单行声明：名字走 `super`
- * 参数，[Check.args] / [Check.checkConfig] / [Check.source] / [Check.target] 全部沿用
- * 接口默认实现，子类不必重复写。
+ * 参数，[Check.args] 沿用接口默认实现，子类不必重复写。
  *
  * 把 [Check.run] 拍平成 receiver-lambda 形式（`override fun Ctx.run()` 在 CheckBase
  * 这一层就是合法签名），子类的 `object` 直接继承即可。

@@ -1,27 +1,31 @@
 # sync_diff
 
-> 分阶段适配上游数据源的数据对账工具。下游固定 Impala，上游按需接入。
+> 分阶段适配上下游数据源的数据对账工具。上游 / 下游都由 Check 自己声明，框架不做兜底。
 
 > **使用方式见 [docs/USAGE.md](docs/USAGE.md)**（命令行、写自己的 Check、字段规则、
 > 新增数据源、调度集成、故障排查）。本文是设计与分阶段路线。
 
 ## 1. 核心思路
 
-- **下游固定**：Impala 用 Hive JDBC 直连，不做抽象。
+- **上下游同一套 Connector**：上游接 Parquet 用 `ParquetConnector`，下游接 Impala 用
+  `ImpalaConnector`；Check 在 `Ctx.run()` 里直接 new 对应 Connector，不经过任何工厂封装。
+  上游 / 下游接什么、用什么配置全在 Check 自己手里——`WilsonActivity*Check` 声明走
+  Parquet + Impala，`OrderSyncCheck` 声明双 Parquet，再写一个 Check 想换源就直接
+  `IcebergRESTConnector(...)` / `PostgresConnector(...)`。
 - **上游按需**：遇到一个源接一个。阶段 1 先接 Parquet（用 DuckDB 读），后续 JDBC 源逐个补齐。
-- **新增源零侵入**：加一个 `Connector` 类 + 工厂一行方法，不动任何已有代码。
+- **新增源零侵入**：加一个实现 `Connector` 的类即可，Check 里直接用它，不动任何已有代码。
 - **代码即配置**：`Check` 对象直接写 SQL 与规则，不引入 Capabilities、PushdownPlanner 之类的元数据层。
 
-Parquet 作为起点的原因：自带完整 schema、row group 流式扫描、天然支持对象存储，跳过 JDBC 流式参数调优，先把 diff 核心跑通。
+Parquet 作为起点的原因：自带完整 schema、row group 流式扫描、天然支持对象存储，跳过 JDBC 流式参数调优，先把 diff 核心跑通。自测 / CI 用 Parquet 当上下游替身也是同一理由——不必起 Impala。
 
 ## 2. 架构
 
 ```mermaid
 flowchart TD
-    Check["Check (Kotlin 对象)"]
+    Check["Check (Kotlin 对象)<br/>自己持有上下游 Connector 与配置"]
     Parquet["ParquetConnector<br/>(DuckDB)"]
-    Impala["ImpalaConnector<br/>(Hive JDBC, 固定)"]
-    Future["PG / MySQL / MSSQL / MC<br/>(阶段 2+ 按需)"]
+    Impala["ImpalaConnector<br/>(Hive JDBC)"]
+    Future["PG / MySQL / MSSQL / MC / …<br/>(阶段 2+ 按需)"]
     Engine["DiffEngine"]
     Report["Reporter<br/>(Markdown + Webhook)"]
 
@@ -281,24 +285,40 @@ private suspend fun <T> Flow<T>.toSetIn(scope: CoroutineScope): Set<T> = scope.a
 
 `Closeable` 资源放进 `CloseableCoroutineScope` 或 `use { }` 模板，不要裸起 `GlobalScope`。
 
-### 4.7 工厂：内联 + `reified` + 命名参数
+### 4.7 构造：命名参数 + 默认值
+
+Connector 直接 new，不为"统一入口"再包一层工厂——多一层类就要多写一份转发代码，
+而且那层类往往只持有配置、只转发构造：
 
 ```kotlin
-class Sources(private val cfg: AppConfig) {
-    fun parquet(path: String, memoryLimit: String = "4GB") =
-        ParquetConnector(path, memoryLimit = memoryLimit)
-    fun impala(table: String) = ImpalaConnector(cfg.impala, table)
-}
+// 上游：Parquet（DuckDB）
+val src = ParquetConnector("/data/orders/dt=2026-09-01/part-0.parquet", memoryLimit = "4GB")
 
-class Targets(private val cfg: AppConfig) {
-    fun impala(table: String) = ImpalaConnector(cfg.impala, table)
-}
+// 下游：Impala（连接信息由 Check 持有，env 兜底）
+val tgtImpalaCfg = ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)   // IMPALA_JDBC_URL / USER / PASSWORD
+val tgt = ImpalaConnector(tgtImpalaCfg)
 
-// 顶层构造：扩展属性，天然作用域
-val Check.source: Sources get() = Sources(checkConfig)
-val Check.target: Targets get() = Targets(checkConfig)
+// 下游换 Parquet 自测：同一套 Connector，一行切换
+val tgtLocal = ParquetConnector("/tmp/tgt.parquet")
+```
 
-// 一次性注册（reflection 一次，启动期完成）
+每个 Check 自己持有自己的连接配置（典型：`@Volatile var myCfg = ImpalaConfig.fromEnv(...)`）。
+框架没有"全局默认下游"——Check 之间互不影响，换连接类时也不会牵动别的 Check。
+
+"默认值"和"必填参数"用 Kotlin 的参数默认值表达，不要为组合参数再造 builder：
+
+```kotlin
+class ImpalaConnector(
+    jdbcUrl: String,
+    user: String? = null,
+    password: String? = null,
+    private val fetchSize: Int = DEFAULT_FETCH_SIZE,
+) : Connector
+```
+
+一次性注册（reflection 一次，启动期完成）：
+
+```kotlin
 inline fun <reified T : Check> CheckRegistry.register() {
     register(T::class.simpleName!!, T)
 }
@@ -327,8 +347,8 @@ inline fun <T> Connector.guard(sql: String, block: () -> T): T =
 object OrderSyncCheck : Check("order_sync") {
     override suspend fun Ctx.run() {
         val dt = args.dt
-        val src = source parquet "/data/orders/dt=$dt/*.parquet"
-        val tgt = target impala "ods.orders"
+        val src = ParquetConnector("/data/orders/dt=$dt/part-0.parquet")
+        val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))
 
         // L1：行数 + 合计 + checksum
         val aggDiffs = diff.aggregate(
@@ -362,9 +382,7 @@ object OrderSyncCheck : Check("order_sync") {
     }
 }
 
-// 顶层内联中缀：把 SQL/参数/规则串成一句
-infix fun Sources.parquet(path: String): Connector = parquet(path)
-infix fun Targets.impala(table: String): Connector = impala(table)
+// 顶层内联中缀：把 SQL 串成一句
 infix fun Connector.query(sql: String): List<Row> = query(sql)
 infix fun Connector.stream(sql: String): Sequence<Row> = stream(sql)
 inline infix fun <T> Sequence<T>.mapBy(getter: String): Sequence<String> = mapNotNull { it.string(getter) }
@@ -437,21 +455,22 @@ class ParquetConnector(
 ### 5.2 使用
 
 ```kotlin
-val src = source.parquet("/data/orders/dt=2026-09-01/*.parquet")
-val tgt = target.impala("ods.orders")
+val src = ParquetConnector("/data/orders/dt=2026-09-01/part-0.parquet")
+val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))  // 生产：连 Impala
+val tgtLocal = ParquetConnector("/tmp/tgt.parquet")                    // 自测：直接读本地 parquet
 
 // 对象存储
-val srcS3 = source.parquet("s3://bucket/orders/dt=2026-09-01/*.parquet")
+val srcS3 = ParquetConnector("s3://bucket/orders/dt=2026-09-01/part-0.parquet")
 ```
 
 ### 5.3 交付物与周期
 
 1 周。包含：
 
-- `ParquetConnector`（DuckDB）、`ImpalaConnector`（Hive JDBC）
+- `ParquetConnector`（DuckDB）、`ImpalaConnector`（Hive JDBC）——上下游共用同一套接口
 - `DiffEngine`（L1 聚合 + L2 主键集合 + L3 行级）
 - `FieldRules` DSL（内置规则 + 自定义扩展函数）
-- `Check` 抽象 + `CheckRegistry`
+- `Check` 抽象 + `CheckRegistry`（连接配置由 Check 自己持有，框架不做兜底）
 - `Reporter`（Markdown + Webhook）
 - CLI（Clikt）
 
@@ -498,9 +517,9 @@ class PostgresConnector(dsn: String, private val fetchSize: Int = 10_000) : Conn
 ```kotlin
 object OrderSyncCheck : Check("order_sync") {
     override fun Ctx.run() {
-        val src = source.parquet("/data/orders/dt=${args.dt}/*.parquet")
-        val tgt = target.impala("ods.orders")
         val dt = args.dt
+        val src = ParquetConnector("/data/orders/dt=$dt/part-0.parquet")
+        val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))
 
         // L1 聚合：行数、合计、checksum
         val srcAgg = src.query("""
@@ -549,23 +568,24 @@ object OrderSyncCheck : Check("order_sync") {
 }
 ```
 
-## 8. 工厂
+## 8. 没有工厂层
+
+`Connector` 就是唯一抽象，Check 里直接 new 具体实现：
 
 ```kotlin
-class ConnectorFactory {
-    // 阶段 1
-    fun parquet(path: String): Connector = ParquetConnector(path)
-    fun impala(table: String): Connector = ImpalaConnector(table)
+// 阶段 1：上下游连接信息由 Check 自己持有（典型 `@Volatile var cfg = ImpalaConfig.fromEnv(...)`）
+val src = ParquetConnector("/data/orders/dt=2026-09-01/part-0.parquet")   // DuckDB
+val tgt = ImpalaConnector(myImpalaConfig)                                // Hive JDBC
 
-    // 阶段 2+
-    fun postgres(dsn: String): Connector = PostgresConnector(dsn)
-    fun mysql(dsn: String): Connector = MySQLConnector(dsn)
-    fun mssql(dsn: String): Connector = MSSQLConnector(dsn)
-    fun maxcompute(project: String): Connector = MaxComputeConnector(project)
-}
+// 阶段 2+
+val srcPg = PostgresConnector("jdbc:postgresql://host:5432/orders")
 ```
 
-每次新增源，只加一行工厂方法 + 一个 Connector 类。
+不设 `ConnectorFactory` 之类的"统一入口"：那种类最终只会是一堆
+`fun x(...) = XConnector(...)` 的转发方法，调用方多绕一层，收益为零。
+新增源 = 写一个实现 `Connector` 的类 + 在 Check 里 new 它，同样零侵入。
+
+需要按配置在运行时选源时，在 Check 里写 `when` 即可——选择逻辑属于业务，不属于连接器。
 
 ## 9. 类型归一
 
@@ -641,7 +661,7 @@ sequenceDiagram
     participant CLI
     participant Check
     participant Src as Connector(上游)
-    participant Tgt as Connector(下游 Impala)
+    participant Tgt as Connector(下游，Check 自己选)
     participant Engine as DiffEngine
     participant Reporter
 
@@ -705,8 +725,8 @@ Gradle 多模块，依赖方向单向：`app → checks → core`。
 
 | 模块 | 职责 | 主要依赖 |
 |:---|:---|:---|
-| `core` | 对账内核：Row / DiffEngine / Connector / FieldRules / Reporter / 配置工厂 | Kotlin、协程、DuckDB JDBC、Impala JDBC |
-| `checks` | Check 抽象与注册表 + 具体对账（`OrderSyncCheck`） | `core`、kotlin-reflect |
+| `core` | 对账内核：Row / DiffEngine / Connector / FieldRules / Reporter | Kotlin、协程、DuckDB JDBC、Impala JDBC |
+| `checks` | Check 抽象与注册表 + 具体对账（`OrderSyncCheck`、`WilsonActivity*Check`） | `core`、kotlin-reflect |
 | `app` | CLI 入口 + Shadow Fat JAR（可执行产物） | `checks`、`core`、Clikt |
 
 ```
@@ -722,8 +742,7 @@ sync_diff/
 │       │   │                 # ConnectorError / FieldRules(DSL) / SequenceExt
 │       │   ├── engine/       # DiffEngine（L1 聚合 / L2 主键集合 / L3 行级）
 │       │   ├── connectors/   # ParquetConnector(DuckDB) / ImpalaConnector(Hive JDBC) / ResultSetExt
-│       │   ├── reporter/     # Reporter（Markdown + Webhook）
-│       │   └── config/       # AppConfig / GlobalConfig / Sources / Targets + 顶层中缀
+│       │   └── reporter/     # Reporter（Markdown + Webhook）
 │       └── test/kotlin/com/kxxnzstdsw/sync_diff/    # 与 main 同构
 ├── checks/
 │   ├── build.gradle.kts
@@ -755,5 +774,7 @@ java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
 ./gradlew :core:test :checks:test
 ```
 
-上游路径由 `ORDERS_PARQUET_PATH` / `ORDERS_TGT_PARQUET_PATH` 控制（阶段 1 两端都走 Parquet
-以便零依赖自测；生产把下游换成 Impala 只需改 `OrderSyncCheck` 的工厂调用）。
+上游路径由 `ORDERS_PARQUET_PATH` / `ORDERS_TGT_PARQUET_PATH` 控制（`OrderSyncCheck` 阶段 1
+两端都走 Parquet 以便零依赖自测；生产要把下游换成 Impala，去 `OrderSyncCheck.defaultConnectors()`
+里替换 Connector、或在 `OrderSyncCheck.injected` 上注入一对目标 Connector）。Wilson 域的两个
+Check 直接以 `IMPALA_URL` / `IMPALA_JDBC_URL` / `IMPALA_USER` / `IMPALA_PASSWORD` 兜底。

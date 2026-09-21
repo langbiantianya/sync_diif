@@ -50,10 +50,11 @@ import kotlin.math.abs
  * 数据源与 test seam：
  * - 默认两端都走 Parquet（[parquetPath] / [tgtParquetPath]，见 [defaultConnectors]），
  *   烟囱测试因此零依赖可跑。
- * - 生产换 Impala 有两条路：改 [defaultConnectors] 让它返回 `ImpalaConnector`，或在执行
- *   前把 [injected] 设成一对 `ImpalaConnector`（不改源码，测试也走这条）。注意 `hash()`
- *   是 DuckDB 方言，tgt 换成 Impala 时聚合 SQL 里的 `SUM(hash(order_id))` 要换成 Impala
- *   的 `SUM(fnv_hash(order_id))`，否则 `h` 列必然不等。
+ * - 上下游各自在 [defaultConnectors] 里明确指定：上游固定走 Parquet；下游目前也是 Parquet
+ *   ——要换 Impala 直接改 [defaultConnectors] 让它返回 `ImpalaConnector(...)`，或在执行前
+ *   把 [injected] 设成一对目标 Connector（不改源码，测试也走这条）。注意 `hash()` 是 DuckDB
+ *   方言，tgt 换成 Impala 时聚合 SQL 里的 `SUM(hash(order_id))` 要换成 Impala 的
+ *   `SUM(fnv_hash(order_id))`，否则 `h` 列必然不等。
  * - 本 Check 实现 [com.kxxnzstdsw.sync_diff.check.Alertable]，CLI 用 `--alert-url` 注入告警地址；空串则不发。
  *
  * 类上的 [BuiltinCheck] 让 [com.kxxnzstdsw.sync_diff.check.DiscoverBuiltin] 在清单文件缺省时
@@ -100,7 +101,7 @@ object OrderSyncCheck : CheckBase("order_sync"), Alertable {
      * 把核心逻辑抽成可测函数（不依赖 [com.kxxnzstdsw.sync_diff.check.Ctx]），测试直接调它覆盖整条数据流。
      *
      * 与 `Ctx.run()` 的分工：这里只算差异并返回 [com.kxxnzstdsw.sync_diff.core.DiffSummary]，报告 / 告警由调用方负责。
-     * 测试传自己的 [com.kxxnzstdsw.sync_diff.core.Connector] 就能绕开 `GlobalConfig` 与 [injected]，不必构造 [com.kxxnzstdsw.sync_diff.check.Ctx]：
+     * 测试传自己的 [com.kxxnzstdsw.sync_diff.core.Connector] 就能绕开 [injected]，不必构造 [com.kxxnzstdsw.sync_diff.check.Ctx]：
      * ```kotlin
      * val summary = OrderSyncCheck.runCheck(src, tgt, dt = "2026-09-20", take = 1000)
      * assertTrue(summary.hasDiff)
@@ -121,25 +122,31 @@ object OrderSyncCheck : CheckBase("order_sync"), Alertable {
         take: Int = 1000,
         engine: DiffEngine = DiffEngine(),
     ): DiffSummary {
-        src.use { s ->
-            tgt.use { t ->
-                // L1：count + sum + checksum，按 dt 对齐
-                val srcAgg = s.query(srcL1Sql(dt))
-                val tgtAgg = t.query(tgtL1Sql(dt))
-                engine.aggregate(srcAgg, tgtAgg, keys = listOf("dt"), rules = l1Rules)
-
-                // L3：行级比对，按 order_id 对齐
-                val srcStream = s.stream(srcL3Sql(dt, take))
-                val tgtStream = t.stream(tgtL3Sql(dt, take))
-                engine.compareRows(
-                    src = srcStream,
-                    tgt = tgtStream,
-                    key = { row -> row["order_id"] ?: error("missing order_id column") },
-                    check = { sRow: Row, tRow: Row -> engine.compare(sRow, tRow, defaultRules) },
-                ).toList()
-            }
-        }
+        src.use { s -> tgt.use { t -> runCheckInner(s, t, dt, take, engine) } }
         return engine.summary()
+    }
+
+    /**
+     * [runCheck] 的实际工作体：在两个活的 [Connector] 上跑 L1 聚合 + L3 行级，状态累加到 [engine]。
+     *
+     * 与 [runCheck] 的分工：[runCheck] 负责 `use { }` 关连接 + 折叠 [engine] 计数器；
+     * 本方法只做两档对账本身。`key` / `check` 闭包集中在这里，避免污染公共签名。
+     */
+    private fun runCheckInner(s: Connector, t: Connector, dt: String, take: Int, engine: DiffEngine) {
+        // L1：count + sum + checksum，按 dt 对齐
+        engine.aggregate(
+            s.query(srcL1Sql(dt)),
+            t.query(tgtL1Sql(dt)),
+            keys = listOf("dt"),
+            rules = l1Rules,
+        )
+        // L3：行级比对，按 order_id 对齐
+        engine.compareRows(
+            src = s.stream(srcL3Sql(dt, take)),
+            tgt = t.stream(tgtL3Sql(dt, take)),
+            key = { row -> row["order_id"] ?: error("missing order_id column") },
+            check = { sRow, tRow -> engine.compare(sRow, tRow, defaultRules) },
+        ).toList()
     }
 
     // -------- 私有：默认 src/tgt 构造（都用 ParquetConnector） --------

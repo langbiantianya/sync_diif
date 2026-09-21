@@ -9,14 +9,15 @@ import com.github.ajalt.clikt.parameters.options.required
 import com.kxxnzstdsw.sync_diff.check.Alertable
 import com.kxxnzstdsw.sync_diff.check.Check
 import com.kxxnzstdsw.sync_diff.check.CheckRegistry
-import com.kxxnzstdsw.sync_diff.config.GlobalConfig
 import kotlinx.coroutines.runBlocking
 
 /**
  * sync_diff 命令行入口（README §13 / §3）。
  *
  * 一次进程跑一条 Check：CLI 只负责「参数 → [Check.Args] → [Check.runWith]」的装配，
- * 对账逻辑全在 Check 自己身上（写自己的 Check 见 [Check] 的 KDoc）。5 步启动流程见 [run]。
+ * 对账逻辑全在 Check 自己身上（写自己的 Check 见 [Check] 的 KDoc）。
+ * **上游 / 下游由 Check 自己声明**——CLI 不再兜底连接信息，连接参数走 Check 自己的 env /
+ * 字段；本入口只负责 `--dt` / `--check` / `--alert-url` / `--registry` 的装配。启动流程见 [run]。
  *
  * ## 选项
  *
@@ -24,13 +25,12 @@ import kotlinx.coroutines.runBlocking
  * |:---|:---|:---|:---|
  * | `--check` | 无，必填 | 无 | 要跑的 Check 名，与 [Check.name] 对齐 |
  * | `--dt` | `1970-01-01` | 无 | 上游分区日，原样透传给 [Check.Args.dt] |
- * | `--impala-url` | `jdbc:impala://localhost:21050` | `IMPALA_URL` | 下游 Impala JDBC URL |
  * | `--alert-url` | 空字符串（不发告警） | `ALERT_URL` | 告警 webhook 地址 |
  * | `--registry` | `checks.txt` | 无 | Check 注册清单文件路径 |
  *
- * 取值优先级：**命令行 > 同名环境变量 > 默认值**。[impalaUrl] / [alertUrl] 是仅有的两个带
- * envvar 绑定的选项；其余选项只认命令行。`--help` 由 Clikt 自动附带，打印用法后退出；
- * 选项缺失或非法同样由 Clikt 报告并以非零码退出。
+ * 取值优先级：**命令行 > 同名环境变量 > 默认值**。[alertUrl] 是仅有的带 envvar 绑定的选项；
+ * 其余选项只认命令行。`--help` 由 Clikt 自动附带，打印用法后退出；选项缺失或非法同样由
+ * Clikt 报告并以非零码退出。
  *
  * ## 用法
  *
@@ -51,11 +51,11 @@ import kotlinx.coroutines.runBlocking
  * java -jar build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20 \
  *     --alert-url https://hooks.example.com/sync-diff
  *
- * # 4) 用环境变量给默认值；命令行仍可逐项覆盖
+ * # 4) 下游连接信息走 Check 自己的 env/字段（CLI 不再兜底）：要切 Impala 集群就改 Check
+ * #    实现里读的 env（Wilson 域默认读 `IMPALA_URL` / `IMPALA_USER` / `IMPALA_PASSWORD`）。
  * IMPALA_URL='jdbc:impala://impala-prod:21050/default' \
  * ALERT_URL='https://hooks.example.com/sync-diff' \
- *     java -jar build/libs/sync_diff-all.jar \
- *         --check order_sync --impala-url jdbc:impala://canary:21050
+ *     java -jar build/libs/sync_diff-all.jar --check wilson_apply_detail_sync
  * ```
  *
  * ## 失败与 fallback
@@ -89,21 +89,9 @@ class SyncDiffCli : CliktCommand(name = "sync_diff") {
     val dt by option("--dt", help = "Date partition").default("1970-01-01")
 
     /**
-     * Impala JDBC URL；可被 `IMPALA_URL` env 覆盖（合同保留 envvar 名字以便与现有调度脚本兼容）。
-     *
-     * 去处：[run] 第 1 步 `GlobalConfig.loadFromEnv(impalaUrl = ...)`，它比
-     * `IMPALA_JDBC_URL` 优先级更高。
-     *
-     * 注意：Clikt 的 `.default(...)` 保证本属性永远非空，所以 [GlobalConfig.loadFromEnv]
-     * 里的 `IMPALA_JDBC_URL` 兜底在 CLI 路径上不会生效；换地址请用本选项或 `IMPALA_URL`。
-     */
-    val impalaUrl by option("--impala-url", envvar = "IMPALA_URL")
-        .default("jdbc:impala://localhost:21050")
-
-    /**
      * 告警 webhook；空字符串表示不发。可被 `ALERT_URL` env 覆盖。
      *
-     * 去处：[run] 第 4 步 `(selected as? Alertable)?.alertUrl = alertUrl`。没实现
+     * 去处：[run] 第 3 步 `(selected as? Alertable)?.alertUrl = alertUrl`。没实现
      * [Alertable] 的 Check 收不到它，也不会因此报错。
      */
     val alertUrl by option("--alert-url", envvar = "ALERT_URL").default("")
@@ -119,42 +107,40 @@ class SyncDiffCli : CliktCommand(name = "sync_diff") {
     /**
      * 启动流程，顺序即语义：
      *
-     * 1. `GlobalConfig.loadFromEnv(impalaUrl = impalaUrl)` —— 用环境变量重建全局配置，
-     *    命令行 [impalaUrl] 优先级最高（命令行 > env > 默认）。
-     * 2. `CheckRegistry.discover(registryPath)` —— 按清单加载 Check；清单缺失 / 无有效行时
+     * 1. `CheckRegistry.discover(registryPath)` —— 按清单加载 Check；清单缺失 / 无有效行时
      *    fallback 到内置 Check。
-     * 3. `registry[check]` —— 按名字取 Check；查不到就抛 [CliktError]，错误信息里带当前
+     * 2. `registry[check]` —— 按名字取 Check；查不到就抛 [CliktError]，错误信息里带当前
      *    可用的 Check 名，随后进程以非零码退出。
-     * 4. `(selected as? Alertable)?.alertUrl = alertUrl` —— 注入告警地址；只有实现了
+     * 3. `(selected as? Alertable)?.alertUrl = alertUrl` —— 注入告警地址；只有实现了
      *    [Alertable] 的 Check 才吃到 [alertUrl]，其余静默忽略。
-     * 5. `runBlocking { selected.runWith(args = Check.Args(dt = dt)) }` —— 跑 Check 主体。
+     * 4. `runBlocking { selected.runWith(args = Check.Args(dt = dt)) }` —— 跑 Check 主体。
      *    [Check.runWith] 是 `suspend`（Check 内部可以开协程并发抓两侧数据），而 Clikt 的
      *    `run()` 是同步签名，所以用 [runBlocking] 在调用线程上把它跑完再返回；CLI 一次进程
      *    只跑一条 Check，不需要常驻调度器或额外的 scope。
      *
-     * 第 5 步的 [Ctx] 由 [Check.runWith] 现建，本方法不持有 [DiffEngine] / [Reporter]，
+     * 第 4 步的 [Ctx] 由 [Check.runWith] 现建，本方法不持有 [DiffEngine] / [Reporter]，
      * 因此同一条 Check 重复执行（测试、循环跑）不会共享计数器。
+     *
+     * 上游 / 下游连接信息（路径 / JDBC URL / 凭据）由 Check 自己负责——CLI 不再做
+     * `GlobalConfig.loadFromEnv(...)` 之类的前置装配。
      */
     override fun run() {
-        // 1) 加载 env，再用 --impala-url 覆盖（命令行 > env > 默认）。
-        GlobalConfig.loadFromEnv(impalaUrl = impalaUrl)
-
-        // 2) 加载 Check 注册清单；文件缺失 / 无有效行时 fallback 到内置 Check。
+        // 1) 加载 Check 注册清单；文件缺失 / 无有效行时 fallback 到内置 Check。
         //    清单里某行写错（类不存在 / 不是 object / 不实现 Check）时 discover 抛
         //    IllegalArgumentException——转成 CliktError，让调度日志看到一行可读信息
         //    而不是 JVM 堆栈；退出码仍是非零，不会把配置错误伪装成成功。
         val registry: CheckRegistry = runCatching { CheckRegistry.discover(registryPath) }
             .getOrElse { e -> throw CliktError(e.message ?: "Cannot load registry: $registryPath") }
 
-        // 3) 解析当前 Check；未命中时把可用名字一起抛出来
+        // 2) 解析当前 Check；未命中时把可用名字一起抛出来
         val selected: Check = registry[check] ?: throw CliktError(
             "Unknown check: $check. Available: ${registry.all().joinToString { it.name }}",
         )
 
-        // 4) 把告警 webhook 注入给声明了 Alertable 的 Check；其它 Check 不关心告警
+        // 3) 把告警 webhook 注入给声明了 Alertable 的 Check；其它 Check 不关心告警
         (selected as? Alertable)?.alertUrl = alertUrl
 
-        // 5) 跑 Check 主体：suspend 函数用 runBlocking 桥到同步 main
+        // 4) 跑 Check 主体：suspend 函数用 runBlocking 桥到同步 main
         runBlocking { selected.runWith(args = Check.Args(dt = dt)) }
     }
 }

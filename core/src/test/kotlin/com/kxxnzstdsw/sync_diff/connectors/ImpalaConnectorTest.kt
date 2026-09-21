@@ -61,4 +61,23 @@ class ImpalaConnectorTest {
             ImpalaConnector("jdbc:impala://no-such-host.invalid:1", "u", "p", fetchSize = 100).use { /* nothing */ }
         }
     }
+
+    @Test
+    fun `ImpalaConfig fromEnv falls back to current when no env set`() {
+        // 没设任何 env → 沿用 current 的全部字段。
+        val current = ImpalaConfig("jdbc:impala://current:21050", "cu", "cp")
+        val result = ImpalaConfig.fromEnv(current)
+        assertEquals("jdbc:impala://current:21050", result.jdbcUrl)
+        assertEquals("cu", result.user)
+        assertEquals("cp", result.password)
+    }
+
+    @Test
+    fun `ImpalaConfig fromEnv preserves user and password from current when env unset`() {
+        // 没设 user/password env → 沿用 current。
+        val current = ImpalaConfig("jdbc:impala://current:21050", "cu", "cp")
+        val result = ImpalaConfig.fromEnv(current)
+        assertEquals("cu", result.user)
+        assertEquals("cp", result.password)
+    }
 }
