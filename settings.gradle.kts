@@ -1,7 +1,6 @@
 pluginManagement {
     repositories {
         maven("https://maven.aliyun.com/repository/central")
-        maven("https://jfrog-internal.sensorsdata.cn/artifactory/maven-public/")
         maven("https://maven.aliyun.com/repository/gradle-plugin")
         gradlePluginPortal()
         mavenCentral()
@@ -11,7 +10,6 @@ pluginManagement {
 gradle.allprojects {
     repositories {
         maven("https://maven.aliyun.com/repository/central")
-        maven("https://jfrog-internal.sensorsdata.cn/artifactory/maven-public/")
         maven("https://maven.aliyun.com/repository/gradle-plugin")
         gradlePluginPortal()
         mavenCentral()
