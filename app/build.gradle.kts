@@ -1,7 +1,7 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
 plugins {
-    kotlin("jvm") version "2.4.20"
+    kotlin("jvm")
     id("com.gradleup.shadow") version "9.6.1"
 }
 
@@ -9,32 +9,21 @@ group = "com.kxxnzstdsw"
 version = "1.0-SNAPSHOT"
 
 dependencies {
-    // CheckRegistry.discover() 的反射 (KClass.objectInstance) 需要 kotlin-reflect
+    // CheckRegistry.discover() 的反射 (KClass.objectInstance) 需要 kotlin-reflect；
+    // 它在 checks 模块，checks 的 implementation 不外传，所以这里要自己声明一份。
     implementation(kotlin("reflect"))
     // CLI
     implementation("com.github.ajalt.clikt:clikt:5.1.0")
 
-    // 协程
+    // 协程：Main.kt 用 runBlocking 把 suspend 的 Check.runWith 桥到同步 main。
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+
     implementation(project(":checks"))
     implementation(project(":core"))
 
     testImplementation(kotlin("test"))
     // 测试
     testImplementation("org.junit.jupiter:junit-jupiter:6.1.0")
-}
-
-kotlin {
-    jvmToolchain(17)
-}
-
-java {
-    targetCompatibility = JavaVersion.VERSION_17
-    sourceCompatibility = JavaVersion.VERSION_17
-}
-
-tasks.test {
-    useJUnitPlatform()
 }
 
 tasks.named<ShadowJar>("shadowJar") {
@@ -71,4 +60,34 @@ tasks.named<ShadowJar>("shadowJar") {
     //    版本一致）。运行时不存在冲突，关 fail 后 shadow 默认按"先到先得"留首份。
     //    若后续依赖冲突真的开始影响行为，再具体保留这一段做精确过滤。
     failOnDuplicateEntries = false
+    // Hive 客户端闭包带进 hadoop 之后，条目数会超过 ZIP 的 65535 上限
+    // （org.apache.tools.zip.Zip64RequiredException）；Kotlin 里这个属性名是 isZip64
+    // （Gradle Zip 的 isZip64()/setZip64() 访问器），不是 zip64。
+    isZip64 = true
+    // 6. 只留目标平台（linux/amd64）的原生库。DuckDB JDBC 自带 4 个平台的
+    //    libduckdb_java.so（osx_universal 103 MB + linux_arm64 51 MB + windows_amd64 34 MB），
+    //    zstd-jni / snappy 又各带十几到二十几个平台的 .so/.dll——加起来让 jar 解压后接近
+    //    480 MB，而调度机只有 linux/amd64 那一份会被加载。排除后 jar 体积降一个量级。
+    //    要在别的架构 / 系统上跑这个 jar，就把对应的一行从下面删掉（例如 macOS 开发机
+    //    需要 libduckdb_java.so_osx_universal 与 darwin/**）。
+    exclude(
+        "libduckdb_java.so_osx_universal",
+        "libduckdb_java.so_linux_arm64",
+        "libduckdb_java.so_windows_amd64",
+        "aix/**",
+        "freebsd/**",
+        "darwin/**",
+        "openbsd/**",
+        "solaris/**",
+        "win/**",
+        "linux/aarch64/**",
+        "linux/arm/**",
+        "linux/i386/**",
+        "linux/mips64/**",
+        "linux/ppc64/**",
+        "linux/ppc64le/**",
+        "linux/riscv64/**",
+        "linux/s390x/**",
+        "linux/loongarch64/**",
+    )
 }

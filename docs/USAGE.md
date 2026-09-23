@@ -65,10 +65,13 @@ org.gradle.java.home=/absolute/path/to/jdk-17
 
 产物在 **`app/build/libs/`**，不是根目录的 `build/libs`（那里没有可执行 jar）。
 
-`shadowJar` 开了 `failOnDuplicateEntries = true`：依赖树里一旦出现重复条目直接构建失败。
-这是有意的——重复条目通常意味着同一份类被两个依赖各自打包（曾经 `reload4j` 与 Impala
-驱动内嵌的 log4j 就这样撞过）。目前唯一需要合并的是几个包里各带一份的法务元数据，由
-`append(...)` 追加合并。
+`shadowJar` 现在关掉了重复条目的严格失败（`failOnDuplicateEntries = false`）：同名 class 在多个
+transitive 里各带一份（kotlin-stdlib、lz4-java…）内容一致，运行时不存在冲突；法务元数据
+（`META-INF/LICENSE|NOTICE|DEPENDENCIES`）用 `append(...)` 追加合并而非丢弃。
+
+同时 jar 里**只保留 linux/amd64 的原生库**（DuckDB 的其他平台 `libduckdb_java.so` 与各平台
+zstd/snappy 加起来约 480 MB 未压缩）；要在 macOS / arm64 上跑这个 jar，去
+`app/build.gradle.kts` 的 `exclude(...)` 里删掉对应那一行再构建。
 
 > `Main-Class` 在 `app/build.gradle.kts` 的 `shadowJar` 里配置（当前
 > `com.kxxnzstdsw.sync_diff.MainKt`）。改动 `Main.kt` 的包名时必须同步改这里，否则
@@ -135,10 +138,11 @@ java -jar app/build/libs/sync_diff-all.jar --check order_sync --registry conf/ch
 # 带告警地址
 java -jar app/build/libs/sync_diff-all.jar --check order_sync --alert-url "$ALERT_URL"
 
-# 只靠环境变量：连接信息走 Check 自己的 env（IMPALA_URL / IMPALA_JDBC_URL / …），
-# 不再走 CLI 的 --impala-url；CLI 这一层只负责 --check / --dt / --alert-url。
-IMPALA_URL='jdbc:hive2://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
-  java -jar app/build/libs/sync_diff-all.jar --check wilson_apply_detail_sync --dt 2026-09-20
+# 只靠环境变量：连接信息走各 Check 自己读的 env（如 ImpalaConfig.fromEnv 读
+# IMPALA_JDBC_URL / IMPALA_USER / IMPALA_PASSWORD），不再走 CLI 的 --impala-url；
+# CLI 这一层只负责 --check / --dt / --alert-url。
+IMPALA_JDBC_URL='jdbc:hive2://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
+  java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
 ```
 
 ### 退出码与失败行为
@@ -147,7 +151,7 @@ IMPALA_URL='jdbc:hive2://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
 |:---|:---|:---:|
 | 正常跑完（有无差异都算正常） | 落报告，返回 | `0` |
 | 选项缺失 / 非法 | Clikt 打印 `Error: missing option --check` + 用法 | `1` |
-| `--check` 名字不存在 | `Error: Unknown check: xxx. Available: order_sync, wilson_apply_detail_sync, wilson_event_header_sync` | `1` |
+| `--check` 名字不存在 | `Error: Unknown check: xxx. Available: order_sync`（可用名字以实际注册结果为准） | `1` |
 | 清单文件里某行反射不出来 | `Error: Registry entry '...' cannot be loaded: ...` | `1` |
 | 清单文件不存在 / 无有效行 | **不是错误**：fallback 到内置 Check | 照常跑 |
 | 对账执行期失败（文件不存在 / SQL 错 / 连不上库） | 抛 `ConnectorError`，未捕获，打印堆栈 | `1` |
@@ -157,7 +161,7 @@ IMPALA_URL='jdbc:hive2://impala-prod:21050/default' ALERT_URL="$ALERT_URL" \
 
 ```text
 $ java -jar app/build/libs/sync_diff-all.jar --check nope
-Unknown check: nope. Available: order_sync, wilson_apply_detail_sync, wilson_event_header_sync   # 实际带 Error: 前缀
+Unknown check: nope. Available: order_sync   # 实际带 Error: 前缀
 ```
 
 **执行期**失败则保留完整堆栈（排查需要），但异常信息本身已经带上了原始 SQL 与底层 cause：
@@ -196,9 +200,10 @@ object UserSyncCheck : CheckBase("user_sync") {
         val src = ParquetConnector("/data/users/dt=$dt/part-0.parquet")        // 上游 Connector
         val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)) // 下游 Connector
 
-        val sql = "SELECT COUNT(*) AS c FROM read_parquet('/data/users/dt=$dt/part-0.parquet')"
-        val srcAgg = src query sql
-        val tgtAgg = tgt query "SELECT COUNT(*) AS c FROM ods.users WHERE dt = '$dt'"
+        val srcAgg = src.query(
+            "SELECT COUNT(*) AS c FROM read_parquet('/data/users/dt=$dt/part-0.parquet')"
+        )
+        val tgtAgg = tgt.query("SELECT COUNT(*) AS c FROM ods.users WHERE dt = '$dt'")
 
         diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt"))
         report.excel("reports/user_sync_$dt.xlsx", diff.summary())
@@ -316,7 +321,7 @@ object UserSyncCheck : CheckBase("user_sync") {
 ### L1 聚合
 
 ```kotlin
-val srcAgg = src query """
+val srcAgg = src.query("""
     SELECT '2026-09-20' AS dt, COUNT(*) AS c, SUM(amount) AS s,
            SUM(hash(order_id)) AS h
     FROM read_parquet('/data/orders/dt=2026-09-20/part-0.parquet')
@@ -358,6 +363,9 @@ val keys = onlyOneSide.toList()     // ⚠ 必须消费，见下
 - **但 `keyDiffCount` 只在消费时累加**：拿到序列不 `toList()` / 不 `forEach`，
   计数永远是 0，`summary()` 会漏掉这档差异。这是最容易踩的一个坑。
 - 输出**去重、不排序**：先 src 独有、再 tgt 独有，各自保持首次出现顺序。
+- **主键为 NULL / 缺列会直接失败**（`IllegalStateException`），不会把那一行悄悄跳过：NULL 主键
+  无法对齐，静默丢弃会让「上游多了一堆主键为 NULL 的脏行」看起来像「两端一致」。要容忍它就在
+  SQL 里写 `WHERE key IS NOT NULL`，或 `COALESCE(key, '<null>')` 显式归一成可比的值。
 
 ### L3 行级
 
@@ -374,6 +382,8 @@ diff.compareRows(
   `src` 必须装得下。两侧都可能很大时，先在 SQL 里采样（哈希桶 / `LIMIT` / 时间窗）。
 - 整行缺失时 emit `FieldDiff.Missing("<row>", Side.SRC/TGT)`，`"<row>"` 是占位字段名。
 - 重复主键保留**首次出现**。
+- 抽样下钻时 `LIMIT` 一定配 `ORDER BY`：只写 `LIMIT` 的话取哪几行由扫描顺序决定
+  （多 part / 并行扫描下不稳定），两次运行会样到不同子集，报告结论不可回归。
 - `srcRowCount` / `tgtRowCount` / `rowDiffCount` 在流被消费时累加。
 
 单行比对直接用 `compare`：
@@ -490,46 +500,54 @@ diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt")) {
 
 **1) 写 Connector**
 
+先判断属于哪一类，绝大多数新源都是前两类——只写建连，取数逻辑一行都不用抄：
+
+**A. JDBC 源**（PG / Oracle / Trino / …）：继承 `JdbcConnector`，只提供连接与方言：
+
 ```kotlin
 package com.kxxnzstdsw.sync_diff.connectors
 
-import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.Connection
-import java.sql.DriverManager
+private const val ORACLE_DRIVER = "oracle.jdbc.OracleDriver"
 
-class PostgresConnector(dsn: String, private val fetchSize: Int = 10_000) : Connector {
-
-    private val conn: Connection = DriverManager.getConnection(dsn).apply {
-        autoCommit = false            // 不关 autoCommit 会全量拉回
-    }
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        guard(sql) {
-            conn.prepareStatement(sql).use { st ->
-                st.fetchSize = fetchSize
-                st.executeQuery().use { rs ->
-                    while (rs.next()) yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() = conn.close()
-}
+class OracleConnector(
+    jdbcUrl: String,
+    user: String? = null,
+    password: String? = null,
+    fetchSize: Int = JdbcConnector.DEFAULT_FETCH_SIZE,
+) : JdbcConnector(
+    // jdbcConnection 会先 Class.forName(驱动)，不依赖 fat jar 里被合并的 service 文件
+    jdbcConnection(ORACLE_DRIVER, jdbcUrl, user, password).also { it.autoCommit = false },
+    fetchSize,
+)
 ```
 
-四条契约（`Connector.kt` 里有完整说明）：
+`query` / `stream`（服务端游标逐行 `yield`）/ `one`（`LIMIT 1`）/ `close` / 失败包装
+（`ConnectorError.QueryFailed`）全部来自基类。方言差异只覆写对应钩子，例如 SQL Server 那样
+没有 `LIMIT` 的方言：
+`override fun oneSql(sql: String) = mssqlTopOne(sql)`。
+
+**B. DuckDB 能直接读的文件源**（Parquet / CSV / Excel / JSONL / 对象存储）：继承
+`DuckDbSessionConnector`，在 super 调用里声明要加载的扩展
+（`httpfsFor(path)`、`listOf("excel")`），取数同样一行不写。
+
+```kotlin
+class MyFileConnector(
+    private val path: String,
+    memoryLimit: String = "4GB",
+    tempDir: String = "/tmp/duckdb_spill",
+) : DuckDbSessionConnector(memoryLimit, tempDir, httpfsFor(path))
+```
+
+**C. 都不是**（REST / 消息队列 / 自研 SDK）：自己实现 `Connector` 的四个方法，遵守下面四条契约：
+
+```kotlin
+class MyApiConnector(private val baseUrl: String) : Connector {
+    override fun query(sql: String): List<Row> = guard(sql) { /* 小结果集：一次拉完 → List<Row> */ }
+    override fun stream(sql: String): Sequence<Row> = sequence { guard(sql) { /* 游标逐条 yield */ } }
+    override fun one(sql: String): Row? = guard(sql) { /* 单条，取不到返回 null */ }
+    override fun close() = Unit
+}
+```
 
 1. 构造期建连、`close()` 释放，调用方用 `use { }` 管生命周期。
 2. 失败必须抛 `ConnectorError`（用 `guard` 包），别让裸 `SQLException` 冒泡。
@@ -539,13 +557,13 @@ class PostgresConnector(dsn: String, private val fetchSize: Int = 10_000) : Conn
    prepare/execute 发生在迭代时，异常会绕过它。
 
 以上文件放在 `core` 模块：
-`core/src/main/kotlin/com/kxxnzstdsw/sync_diff/connectors/PostgresConnector.kt`。
+`core/src/main/kotlin/com/kxxnzstdsw/sync_diff/connectors/`。
 
 **2) 直接 new 它**（没有工厂层要改）
 
 ```kotlin
 override suspend fun Ctx.run() {
-    val src = PostgresConnector("jdbc:postgresql://host:5432/orders")   // ← 新增一个 Connector
+    val src = PgConnector(PgConfig("jdbc:postgresql://host:5432/orders"))  // ← 新增一个 Connector
     val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))
     // ...
 }
@@ -557,10 +575,14 @@ override suspend fun Ctx.run() {
 **3) 加驱动依赖**（`core/build.gradle.kts`，不是根目录——根目录没有 build 文件）
 
 ```kotlin
-implementation("org.postgresql:postgresql:42.7.4")
+runtimeOnly("org.postgresql:postgresql:42.7.13")   // 与现有驱动一致写 runtimeOnly
 ```
 
 驱动装在 `core` 里，`checks` / `app` 通过 `implementation(project(":core"))` 自动带上。
+
+连接器里**显式 `Class.forName(驱动类)`**（`jdbcConnection(...)` 已经这么做了）：fat jar 里
+`META-INF/services/java.sql.Driver` 被合并成一份，一旦其中某个驱动类加载不了（例如旧版本
+hive-jdbc 的 Java 21 字节码跑在 JDK 17 上），扫描会在那里中断，排在它后面的驱动全部失效。
 
 **4) 处理类型归一** —— 如果驱动返回了 `ResultSetExt.coerceType` 还没覆盖的类型，
 去那里加分支，而不是在 Check 里散落转换（见下）。
@@ -570,9 +592,9 @@ implementation("org.postgresql:postgresql:42.7.4")
 | 源 | 关键参数 | 陷阱 |
 |:---|:---|:---|
 | PostgreSQL | `autoCommit=false` + `fetchSize=10000` | 不关 autoCommit 会全量拉回 |
-| MySQL | `useCursorFetch=true` + `setFetchSize(Integer.MIN_VALUE)` | 流式期间连接不能复用 |
-| MSSQL | `responseBuffering=adaptive` | 默认全缓冲 |
-| MaxCompute | ODPS JDBC + Tunnel 分批 | Tunnel 单次 1 万行限制需放开，类型映射非标准 |
+| MySQL | `autoCommit=false` + `fetchSize=10000` + URL 里 `useCursorFetch=true` | 少 `useCursorFetch=true` 时 `fetchSize` 不生效，驱动全量拉回 |
+| MSSQL | `autoCommit=false` + `fetchSize=10000`；`one()` 走 `SELECT TOP 1` | 默认全缓冲 |
+| MaxCompute | ODPS JDBC 直连（不支持显式事务，故不设 `autoCommit=false`） | 类型映射非标准 |
 
 ### 类型归一集中在哪
 
@@ -726,11 +748,15 @@ CLI 不再做"前置装配"——`--impala-url` 已删除，连接信息走 Chec
 ### 代码里改连接配置
 
 ```kotlin
-// 直接给字段赋值（@Volatile 写读并发安全）
-OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig("jdbc:hive2://canary:21050", "etl", "secret"))
+// 内置 Check 的 test seam：换上游 / 下游路径（@Volatile，读写并发安全）
+OrderSyncCheck.parquetPath = "/data/orders_canary/dt=2026-09-20/part-0.parquet"
+OrderSyncCheck.tgtParquetPath = "/data/orders_tgt_canary/dt=2026-09-20/part-0.parquet"
 
-// 或者重新 fromEnv 一次
-OrderSyncCheck.tgt = ImpalaConnector(ImpalaConfig.fromEnv())
+// 要整体换掉两端 Connector（例如下游换成 Impala），用 injected：
+OrderSyncCheck.injected = ParquetConnector(OrderSyncCheck.parquetPath) to
+    ImpalaConnector(ImpalaConfig("jdbc:hive2://canary:21050", "etl", "secret"))
+
+// 自己写的 Check 里更直接：@Volatile var cfg = ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)
 ```
 
 Impala JDBC URL 形态与三种认证（驱动：`org.apache.hive:hive-jdbc`，scheme `jdbc:hive2://`）：
@@ -826,18 +852,20 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 ./gradlew :checks:test         # 只跑 Check 层
 ```
 
-用例分布（共 78 个）：
+用例分布（共 95 个；`./gradlew test` 的 "tests completed" 计数）：
 
 | 模块 | 用例文件 | 覆盖 |
 |:---|:---|:---|
-| `core`（66） | `core/src/test/kotlin/.../core/CoreTypesTest.kt` | Row 扩展、FieldRules 两种写法、DiffSummary |
-| | `.../engine/DiffEngineTest.kt` | 三档 diff、计数器、`keySet` 去重与扫描次数 |
-| | `.../connectors/ParquetConnectorTest.kt` | DuckDB 读写、类型归一、`guard` 契约 |
-| | `.../connectors/ImpalaConnectorTest.kt` | 接口形状、`ImpalaConfig.fromEnv`、连不上时 fail fast |
-| | `.../reporter/ReporterTest.kt` | 手写 OOXML 写出的 `.xlsx` 用 POI（仅测试期依赖）读回校验 + webhook JSON |
-| `checks`（31） | `checks/src/test/kotlin/.../check/CheckTest.kt` | Args 注入 |
-| | `.../check/CheckRegistryTest.kt` | 注册、查重、`discover` |
-| | `.../checks/OrderSyncCheckEndToEndTest.kt` | 端到端（DuckDB 造数 → 跑 Check → 断言 Summary） |
+| `core`（77） | `core/src/test/kotlin/.../core/CoreTypesTest.kt`（27） | Row 扩展、FieldRules 两种写法、DiffSummary |
+| | `.../engine/DiffEngineTest.kt`（17） | 三档 diff、计数器、`keySet` 去重与扫描次数 |
+| | `.../connectors/ParquetConnectorTest.kt`（5） | DuckDB 读写、类型归一、`guard` 契约 |
+| | `.../connectors/JdbcConnectorContractTest.kt`（5） | `JdbcConnector` 的取数语义与「失败必抛 `ConnectorError`」（含 `stream`），用内置 H2 当方言替身 |
+| | `.../connectors/MssqlTopOneTest.kt`（5） | `one()` 的 T-SQL 改写（`SELECT TOP 1`）与边界 |
+| | `.../connectors/ImpalaConnectorTest.kt`（3） | `ImpalaConfig.fromEnv` 优先级、连不上时 fail fast |
+| | `.../reporter/ReporterTest.kt`（15） | 手写 OOXML 写出的 `.xlsx` 用 POI（仅测试期依赖）读回校验 + webhook JSON |
+| `checks`（18） | `checks/src/test/kotlin/.../check/CheckTest.kt`（6） | Args 注入、注册表语义 |
+| | `.../check/CheckRegistryTest.kt`（8） | 注册、查重、`discover` |
+| | `.../checks/OrderSyncCheckEndToEndTest.kt`（4） | 端到端（DuckDB 造数 → 跑 Check → 断言 Summary） |
 | `app`（0） | — | CLI 目前靠手工冒烟（见 §2） |
 
 ---
@@ -847,7 +875,7 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 | 现象 | 原因 | 处理 |
 |:---|:---|:---|
 | `ConnectorError$QueryFailed: ... No files found that match the pattern` | SQL 里的 `read_parquet('...')` 路径不存在 | 检查 `ORDERS_PARQUET_PATH` 等路径与分区日期 |
-| `Unknown check: xxx. Available: order_sync, wilson_apply_detail_sync, wilson_event_header_sync` | `--check` 名字不对，或清单文件没加载到 | 名字区分大小写；确认 `--registry` 指向的文件存在且有有效行 |
+| `Unknown check: xxx. Available: order_sync` | `--check` 名字不对，或清单文件没加载到 | 名字区分大小写；可用名字以报错信息里列的为准；确认 `--registry` 指向的文件存在且有有效行 |
 | `Registry entry '...' cannot be loaded` | 清单里的 FQCN 不存在 / 不是 `object` / 没实现 `Check` | 用全限定名，且声明为 `object` |
 | 报告写出来了，但 `summary.diffCount` 永远是 0 | L2 序列拿到了没消费 | `keySet(...).toList()`，见 §4 |
 | L1 每个分区都报差异，但 L3 查不出问题 | `aggregate` 没给浮点聚合列挂容忍度 | 传 `rules`，把 `SUM(...)` 列绑上 `tolerance` |
@@ -870,8 +898,12 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 
 1. **`summary()` 最高只到 WARN**，无法区分 Mismatch 与 Missing；需要 ERROR 档请自行用
    `DiffSummary.accumulate` 折算。
-2. **`ImpalaConnector` 没有对真实 Impala 的集成测试**（无可用实例）。连接参数与游标设置
-   按 README §6 实现，上线前请用真实 Impala 回归一次。
+2. **`ImpalaConnector` 没有对真实 Impala 的集成测试**（无可用实例）。已验证到「驱动能加载并真的
+   去建 TCP 连接」这一层（JDK 17 下 `HiveDriver` 注册成功，连不上时报
+   `TTransportException: ConnectException`），Kerberos / SASL / 结果集归一这些只有真实集群能验，
+   上线前请回归一次。
+   驱动固定在 `hive-jdbc:4.1.0:standalone`（见 `core/build.gradle.kts` 的注释）：4.2.x 的驱动是
+   Java 21 字节码，JDK 17 运行时会让**所有** JDBC 驱动注册失效（详见 README §13）。
 3. **`OrderSyncCheck` 的 L1 checksum 用 DuckDB 的 `hash()`**，是方言函数；目标端换成
    Impala 时要改成 `fnv_hash()` 之类的等价函数，否则 checksum 列必然不平。
 4. **`OrderSyncCheck` 阶段 1 默认两端都走 Parquet**，便于零依赖自测；生产要把下游换成
@@ -880,3 +912,10 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
    风险——README §15 已列为中风险项。
 6. **`DiffEngine` 不是线程安全的**：一个 Check 一次执行一个实例。要在同一个 Check 里并发
    跑多档 diff，用 `Ctx.diff` 之外自己 new 的实例。
+7. **MySQL 的流式需要 URL 里带 `useCursorFetch=true`**：Connector-J 只在这个参数打开时才按
+   `fetchSize` 走服务端游标，否则 `stream()` 会把整表拉回客户端再切分（惰性形同虚设）。连接器
+   不代改 URL，写 `MySQLConfig` 时自己带上。
+8. **L2 的 `keySet` 对 NULL 主键直接失败**，不会静默跳过：NULL 主键没法对齐，跳过会让"上游多出来
+   的脏行"看起来像"两端一致"。要容忍就在 SQL 里 `WHERE key IS NOT NULL` 或 `COALESCE` 归一。
+9. **抽样下钻的 `LIMIT` 必须配 `ORDER BY`**：只写 `LIMIT` 时取哪几行由扫描顺序决定，两次运行
+   样到不同子集，结论不可回归。

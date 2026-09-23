@@ -167,12 +167,16 @@ class DiffEngine {
      *
      * 陷阱：[keyDiffCount] 在序列被**消费**时逐条累加，所以拿到序列不消费（不 `toList()`、
      * 不 `forEach`）就永远是 0，[summary] 会漏掉这档差异。
+     *
+     * **`key` 列为 NULL 时直接失败**（[IllegalStateException]）：NULL 主键无法参与对齐，
+     * 静默丢弃会让"上游多了一堆主键为 NULL 的脏行"看起来像"两端一致"——对账工具最不该犯的错。
+     * 需要容忍它就在 SQL 里显式处理（`WHERE key IS NOT NULL` 或 `COALESCE(key, '<null>')`）。
      */
     fun keySet(src: Sequence<Row>, tgt: Sequence<Row>, key: String): Sequence<String> {
         // 两侧各物化一次：用 `Sequence.minus` 做两次差额会把每一侧都再跑一遍
         // （`minus` 会物化对侧，两个方向的差额正好把两侧各读两遍）。
-        val srcKeys = src.mapNotNullTo(LinkedHashSet()) { it[key]?.toString() }
-        val tgtKeys = tgt.mapNotNullTo(LinkedHashSet()) { it[key]?.toString() }
+        val srcKeys = src.mapNotNullTo(LinkedHashSet()) { it.requireKey(key, "src") }
+        val tgtKeys = tgt.mapNotNullTo(LinkedHashSet()) { it.requireKey(key, "tgt") }
         return sequence {
             srcKeys.forEach {
                 if (it !in tgtKeys) {
@@ -332,6 +336,14 @@ class DiffEngine {
     /** 把 [Row] 按 [keys] 拼成不可变的 `Map<String, Any?>`，缺列填 null。 */
     private fun keyOf(row: Row, keys: List<String>): Map<String, Any?> =
         keys.associateWith { row[it] }
+
+    /**
+     * L2 取主键：缺列或值为 null 都视为"没有可对齐的主键"，直接失败而不是跳过这一行
+     * （理由见 [keySet] 的 KDoc）。[side] 只用于报错信息，指出是哪一侧的数据。
+     */
+    private fun Row.requireKey(key: String, side: String): String =
+        this[key]?.toString()
+            ?: error("keySet: $side row has NULL/missing key '$key' ($values); filter it in SQL or map it explicitly")
 
     /**
      * 单主键两端的字段差。

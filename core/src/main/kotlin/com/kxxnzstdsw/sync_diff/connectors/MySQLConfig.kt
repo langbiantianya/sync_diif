@@ -1,9 +1,7 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
-import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.DriverManager
+private const val MYSQL_DRIVER: String = "com.mysql.cj.jdbc.Driver"
+
 
 /**
  * MySQL 连接配置。
@@ -14,7 +12,7 @@ import java.sql.DriverManager
  * MySQLConfig("jdbc:mysql://mysql-prod:3306/ods", "etl", "secret")
  * ```
  *
- * 环境变量注入：[fromEnv] 是唯一的入口。
+ * 环境变量注入：[fromEnv] 是唯一的入口（`MYSQL_JDBC_URL` 必填，缺失即抛）。
  */
 data class MySQLConfig(
     val jdbcUrl: String,
@@ -34,10 +32,16 @@ data class MySQLConfig(
 /**
  * MySQL 连接器。
  *
- * 构造期建连；[stream] 使用 `fetchSize` 服务端游标逐行 yield。
+ * 建连 / 取数 / 失败包装的公共实现见 [JdbcConnector]；`autoCommit = false` 已由本类设置。
+ *
+ * **注意**：Connector-J 只在 URL 带 `useCursorFetch=true` 时才按 `fetchSize` 服务端游标取数，
+ * 否则会把整表拉回客户端再切分——那样 [stream] 的惰性就失效了。本类不代改 URL（也不做隐式
+ * 拼接），所以接 MySQL 时请自己写全：
  *
  * ```kotlin
- * MySQLConnector(MySQLConfig("jdbc:mysql://mysql-prod:3306/ods")).use { conn ->
+ * MySQLConnector(
+ *     MySQLConfig("jdbc:mysql://mysql-prod:3306/ods?useCursorFetch=true", "etl", "secret"),
+ * ).use { conn ->
  *     conn.query("SELECT * FROM orders WHERE dt = '2026-09-01'")
  * }
  * ```
@@ -46,38 +50,16 @@ class MySQLConnector(
     jdbcUrl: String,
     user: String? = null,
     password: String? = null,
-    private val fetchSize: Int = DEFAULT_FETCH_SIZE,
-) : Connector {
-
-    private val conn = DriverManager.getConnection(jdbcUrl, user, password).also {
-        it.autoCommit = false
-    }
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs ->
-                while (rs.next()) {
-                    yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() {
-        conn.close()
-    }
-
-    private companion object {
-        const val DEFAULT_FETCH_SIZE: Int = 10_000
-    }
+    fetchSize: Int = DEFAULT_FETCH_SIZE,
+) : JdbcConnector(
+    jdbcConnection(MYSQL_DRIVER, jdbcUrl, user, password).also { it.autoCommit = false },
+    fetchSize,
+) {
+    /** 构造自 [MySQLConfig]：Check 里最常用的入口。 */
+    constructor(cfg: MySQLConfig, fetchSize: Int = DEFAULT_FETCH_SIZE) : this(
+        jdbcUrl = cfg.jdbcUrl,
+        user = cfg.user,
+        password = cfg.password,
+        fetchSize = fetchSize,
+    )
 }

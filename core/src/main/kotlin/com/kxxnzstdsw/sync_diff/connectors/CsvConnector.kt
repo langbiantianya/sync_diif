@@ -1,60 +1,29 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
 import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.DriverManager
 
 /**
- * CSV connector using DuckDB read_csv_auto.
+ * CSV 连接器：DuckDB `read_csv_auto`，自动推断列类型。
  *
- * @param path local path, glob, or s3/oss path
- * @param memoryLimit DuckDB memory limit
- * @param tempDir DuckDB spill directory
- * @param csvOptions extra options for read_csv_auto
+ * 建会话 / 取数的公共实现见 [DuckDbSessionConnector]；[path] 只用于判断是否 `s3://` /
+ * `oss://`（自动加载 httpfs），**读哪些文件由调用方写的 SQL 决定**：
+ *
+ * ```kotlin
+ * CsvConnector("/data/orders/2026-09-01.csv").use { src ->
+ *     src.stream("SELECT * FROM read_csv_auto('$path')").take(1000).toList()
+ * }
+ * ```
+ *
+ * CSV 的解析选项（`header` / `delim` / `columns` / 编码……）写在 **SQL 里**
+ * （`read_csv_auto('…', header = true, delim = '\t')`）——本类不代拼接 SQL，所以没有
+ * "options 构造参数"这种东西。
+ *
+ * @param path 本地路径、glob 或 `s3://` / `oss://` 路径（仅用于决定是否加载 httpfs）
+ * @param memoryLimit DuckDB 引擎侧内存上限
+ * @param tempDir 超出 [memoryLimit] 时的 spill 目录
  */
 class CsvConnector(
     private val path: String,
-    private val memoryLimit: String = "4GB",
-    private val tempDir: String = "/tmp/duckdb_spill",
-    private val csvOptions: String = "",
-) : Connector {
-
-    private val conn = DriverManager.getConnection(JDBC_URL).apply {
-        autoCommit = false
-        createStatement().use { st ->
-            st.execute("SET memory_limit = '$memoryLimit'")
-            st.execute("SET temp_directory = '$tempDir'")
-            if (path.startsWith("s3://") || path.startsWith("oss://")) {
-                st.execute("INSTALL httpfs")
-                st.execute("LOAD httpfs")
-            }
-        }
-    }
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        guard(sql) {
-            conn.prepareStatement(sql).use { st ->
-                st.executeQuery().use { rs ->
-                    while (rs.next()) yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() {
-        conn.close()
-    }
-
-    private companion object {
-        private const val JDBC_URL = "jdbc:duckdb:"
-    }
-}
+    memoryLimit: String = "4GB",
+    tempDir: String = "/tmp/duckdb_spill",
+) : DuckDbSessionConnector(memoryLimit, tempDir, httpfsFor(path))

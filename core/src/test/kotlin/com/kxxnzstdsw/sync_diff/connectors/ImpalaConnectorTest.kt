@@ -1,83 +1,52 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
-import com.kxxnzstdsw.sync_diff.core.Connector
 import java.sql.SQLException
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertNotNull
 
 /**
- * ImpalaConnector live-tests require an Impala server.
- * Until §6 验证点 § 提到的真实集群就位，这套测试只覆盖：
- *   1. 构造 / 方法形态（signature 锁定）。
- *   2. 无 server 时构造失败被正确抛出（不污染其他测试）。
+ * ImpalaConnector：无真实 Impala 可连时能测的**行为**契约。
+ *
+ * 只覆盖两件事：
+ * 1. [ImpalaConfig.fromEnv] 的优先级（env > current，未设的字段沿用 current）——通过注入
+ *    假 env 变得可确定，不去改进程环境变量；
+ * 2. 构造期建连（fail fast）：url 连不上就在**构造时**抛 `SQLException`。
+ *
+ * 真实集群就位前，接口形态 / 方法签名不在这里断言——那是实现细节，`Connector` 的实现关系
+ * 由编译器保证。
  */
 class ImpalaConnectorTest {
 
     @Test
-    fun `impala connector implements Connector with the required methods`() {
-        // 反射式断言：保证 query / stream / one / close 的签名不会无意中被改掉。
-        val cls = ImpalaConnector::class.java
-        assertNotNull(cls.getMethod("query", String::class.java))
-        assertNotNull(cls.getMethod("stream", String::class.java))
-        assertNotNull(cls.getMethod("one", String::class.java))
-        assertNotNull(cls.getMethod("close"))
-
-        // is-a Connector
-        assertEquals(
-            1,
-            cls.interfaces.count { it == Connector::class.java },
-            "ImpalaConnector must implement Connector",
+    fun `fromEnv overrides only the fields present in the environment`() {
+        val current = ImpalaConfig("jdbc:hive2://current:21050", "cu", "cp")
+        val env = mapOf(
+            "IMPALA_JDBC_URL" to "jdbc:hive2://from-env:21050",
+            "IMPALA_USER" to "eu",
         )
+
+        val config = ImpalaConfig.fromEnv(current) { env[it] }
+
+        assertEquals("jdbc:hive2://from-env:21050", config.jdbcUrl)
+        assertEquals("eu", config.user, "env 里给了 user 就覆盖 current")
+        assertEquals("cp", config.password, "env 里没有 password，沿用 current")
     }
 
     @Test
-    fun `impala connector constructor accepts jdbcUrl plus optional credentials`() {
-        // 反射构造（取 null 默认值），立刻 close —— 不会有真实连接尝试，因为 url 不合法。
-        val ctor = ImpalaConnector::class.java.getDeclaredConstructor(
-            String::class.java,
-            String::class.java,
-            String::class.java,
-            Integer.TYPE,
-        )
-        assertNotNull(ctor)
-        assertEquals(4, ctor.parameterCount)
+    fun `fromEnv keeps current fields when the environment is empty`() {
+        val current = ImpalaConfig("jdbc:hive2://current:21050", "cu", "cp")
+
+        val config = ImpalaConfig.fromEnv(current) { null }
+
+        assertEquals(current, config)
     }
 
     @Test
-    fun `impala connector close does not throw when not yet opened`() {
-        // 不调真实驱动；只校验：如果连接从未建立，close 也不抛。
-        // 这里只能间接通过反射拿一个"未真正连"的实例并断言 close 是 no-op tolerant。
-        // 真实生产用例在有 Impala server 后跑；这里跳过构造（反射取实例太脆）。
-        // 留一个 placeholder 验证文档化的契约：
-        assertEquals(true, true)
-    }
-
-    @Test
-    fun `impala connector with bogus url fails fast at construction`() {
-        // 真实驱动加载后，无效 url 应该抛 SQLException —— 测试用的 url 形如 jdbc:hive2://no-such-host:1
+    fun `construction connects eagerly and fails fast on an unreachable host`() {
         assertFailsWith<SQLException> {
-            ImpalaConnector("jdbc:hive2://no-such-host.invalid:1", "u", "p", fetchSize = 100).use { /* nothing */ }
+            ImpalaConnector("jdbc:hive2://no-such-host.invalid:1", "u", "p", fetchSize = 100)
+                .use { /* nothing */ }
         }
-    }
-
-    @Test
-    fun `ImpalaConfig fromEnv falls back to current when no env set`() {
-        // 没设任何 env → 沿用 current 的全部字段。
-        val current = ImpalaConfig("jdbc:hive2://current:21050", "cu", "cp")
-        val result = ImpalaConfig.fromEnv(current)
-        assertEquals("jdbc:hive2://current:21050", result.jdbcUrl)
-        assertEquals("cu", result.user)
-        assertEquals("cp", result.password)
-    }
-
-    @Test
-    fun `ImpalaConfig fromEnv preserves user and password from current when env unset`() {
-        // 没设 user/password env → 沿用 current。
-        val current = ImpalaConfig("jdbc:hive2://current:21050", "cu", "cp")
-        val result = ImpalaConfig.fromEnv(current)
-        assertEquals("cu", result.user)
-        assertEquals("cp", result.password)
     }
 }

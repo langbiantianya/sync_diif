@@ -2,10 +2,6 @@ package com.kxxnzstdsw.sync_diff.check
 
 import com.kxxnzstdsw.sync_diff.engine.DiffEngine
 import com.kxxnzstdsw.sync_diff.reporter.Reporter
-import kotlinx.datetime.LocalDate.Companion.Format
-import kotlinx.datetime.format
-import kotlinx.datetime.format.char
-import kotlinx.datetime.toKotlinLocalDate
 import java.time.LocalDate
 
 /**
@@ -15,13 +11,16 @@ import java.time.LocalDate
  * ```kotlin
  * object OrderSyncCheck : CheckBase("order_sync") {
  *     override suspend fun Ctx.run() {
- *         val dt = args.dt                                                     // ① 本次运行参数
- *         val src = ParquetConnector("/data/orders/dt=$dt/part-0.parquet")     // ② 上游 Connector
- *         val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))  // ③ 下游 Connector
- *
- *         val sql = "SELECT COUNT(*) AS c FROM read_parquet('/data/orders/dt=$dt/part-0.parquet')"
- *         diff.aggregate(src query sql, tgt query sql, keys = listOf("dt"))    // ④ 本次执行
- *         report.excel("reports/order_sync.xlsx", diff.summary())             // ⑤ 本次执行
+ *         val dt = args.dt                                                       // ① 本次运行参数
+ *         val path = "/data/orders/dt=$dt/part-0.parquet"
+ *         ParquetConnector(path).use { src ->                                    // ② 上游 Connector
+ *             ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT)).use { tgt -> // ③ 下游
+ *                 val srcAgg = src.query("SELECT COUNT(*) AS c FROM read_parquet('$path')")
+ *                 val tgtAgg = tgt.query("SELECT COUNT(*) AS c FROM ods.orders WHERE dt = '$dt'")
+ *                 diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt"))             // ④ 本次执行
+ *             }
+ *         }
+ *         report.excel("reports/order_sync_$dt.xlsx", diff.summary())             // ⑤ 本次执行
  *     }
  * }
  * ```
@@ -86,14 +85,12 @@ sealed interface Check {
      * （`null`），不要给它编造默认值的语义。
      */
     data class Args(
-        /** 上游分区日，形如 `2026-09-20`；默认今天（本地时区），兼容未传 dt 的场景。 */
-        val dt: String = LocalDate.now().toKotlinLocalDate().format(Format {
-            year()
-            char('-')
-            monthNumber()
-            char('-')
-            day()
-        }),
+        /**
+         * 上游分区日，形如 `2026-09-20`（ISO-8601 日期）；默认今天（JVM 默认时区），兼容未传
+         * dt 的场景。用 [LocalDate.toString] 而不是自己拼格式：ISO 就是各数据源分区路径 /
+         * `WHERE dt = '...'` 认的形式，少一处能写错的格式串（也少一个 kotlinx-datetime 依赖）。
+         */
+        val dt: String = LocalDate.now().toString(),
         /** 业务自定义参数，默认空表；键 / 值都是调用方自定义的字符串。 */
         val params: Map<String, String> = emptyMap(),
     )

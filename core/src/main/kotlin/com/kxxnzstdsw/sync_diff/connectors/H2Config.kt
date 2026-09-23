@@ -1,9 +1,7 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
-import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.DriverManager
+private const val H2_DRIVER: String = "org.h2.Driver"
+
 
 /**
  * H2 连接配置。
@@ -33,7 +31,8 @@ data class H2Config(
 /**
  * H2 连接器：嵌入式或远程 H2 数据库。
  *
- * 构造期建连；[stream] 使用 `fetchSize` 服务端游标逐行 yield。
+ * 建连 / 取数 / 失败包装的公共实现见 [JdbcConnector]。生产对账不用它，主要价值是**测试替身**：
+ * 内置 JDBC 源，可零依赖起一个 `jdbc:h2:mem:` 实例验证 Check 的 SQL 与 [JdbcConnector] 契约。
  *
  * ```kotlin
  * H2Connector(H2Config("jdbc:h2:mem:test")).use { conn ->
@@ -45,38 +44,16 @@ class H2Connector(
     jdbcUrl: String,
     user: String = "sa",
     password: String = "",
-    private val fetchSize: Int = DEFAULT_FETCH_SIZE,
-) : Connector {
-
-    private val conn = DriverManager.getConnection(jdbcUrl, user, password).also {
-        it.autoCommit = false
-    }
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs ->
-                while (rs.next()) {
-                    yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() {
-        conn.close()
-    }
-
-    private companion object {
-        const val DEFAULT_FETCH_SIZE: Int = 10_000
-    }
+    fetchSize: Int = DEFAULT_FETCH_SIZE,
+) : JdbcConnector(
+    jdbcConnection(H2_DRIVER, jdbcUrl, user, password).also { it.autoCommit = false },
+    fetchSize,
+) {
+    /** 构造自 [H2Config]。 */
+    constructor(cfg: H2Config, fetchSize: Int = DEFAULT_FETCH_SIZE) : this(
+        jdbcUrl = cfg.jdbcUrl,
+        user = cfg.user,
+        password = cfg.password,
+        fetchSize = fetchSize,
+    )
 }

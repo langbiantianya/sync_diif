@@ -1,5 +1,5 @@
 plugins {
-    kotlin("jvm") version "2.4.20"
+    kotlin("jvm")
 }
 
 group = "com.kxxnzstdsw"
@@ -9,26 +9,13 @@ dependencies {
     // CheckRegistry.discover() 的反射 (KClass.objectInstance) 需要 kotlin-reflect
     implementation(kotlin("reflect"))
 
-    implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.8.0")
-    // 协程
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    // 协程库只有测试用得到（runBlocking 驱动 suspend 的 Check.run）；`suspend` 本身是语言特性，
+    // 主源码不需要它。真正的运行时依赖由 app 声明。
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 
     implementation(project(":core"))
 
     testImplementation(kotlin("test"))
     // 测试
     testImplementation("org.junit.jupiter:junit-jupiter:6.1.0")
-}
-
-kotlin {
-    jvmToolchain(17)
-}
-
-java {
-    targetCompatibility = JavaVersion.VERSION_17
-    sourceCompatibility = JavaVersion.VERSION_17
-}
-
-tasks.test {
-    useJUnitPlatform()
 }

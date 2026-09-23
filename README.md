@@ -10,7 +10,7 @@
 - **上下游同一套 Connector**：上游接 Parquet 用 `ParquetConnector`，下游接 Impala 用
   `ImpalaConnector`；Check 在 `Ctx.run()` 里直接 new 对应 Connector，不经过任何工厂封装。
   上游 / 下游接什么、用什么配置全在 Check 自己手里——`OrderSyncCheck` 声明双
-  Parquet + Impala，再写一个 Check 想换源就直接 `IcebergRESTConnector(...)` / `PostgresConnector(...)`。
+  Parquet + Impala，再写一个 Check 想换源就直接 `IcebergRESTConnector(...)` / `PgConnector(...)`。
 - **上游按需**：遇到一个源接一个。阶段 1 先接 Parquet（用 DuckDB 读），后续 JDBC 源逐个补齐。
 - **新增源零侵入**：加一个实现 `Connector` 的类即可，Check 里直接用它，不动任何已有代码。
 - **代码即配置**：`Check` 对象直接写 SQL 与规则，不引入 Capabilities、PushdownPlanner 之类的元数据层。
@@ -260,31 +260,28 @@ fun <T> Sequence<T>.sampled(ratio: Double, seed: Long = 42L): Sequence<T> = sequ
 Scope function 用法要克制：`apply` 配构造、`also` 配副作用、`with` 配临时作用域、`let` 配 null 安全链、`use` 配资源。
 
 ```kotlin
+val alertUrl = System.getenv("ALERT_URL") ?: ""      // 空串时 webhook 内部直接 no-op
 val diffSummary = diff.summary().also { report.excel(path, it) }
-    .let { if (it.hasDiff) report.webhook(env("ALERT_URL"), it); it }
+    .let { if (it.hasDiff) report.webhook(alertUrl, it); it }
 ```
 
-### 4.6 协程与结构化并发（流式场景）
+### 4.6 协程与结构化并发
 
-`Connector.stream` 同步；如果上游源天然支持异步或想并发跑两端的 L2，用 `Flow` + `coroutineScope`：
+`Connector` / `DiffEngine` 全部是同步 API，**仓库当前没有任何 Flow 使用**：`Check.run` 是
+`suspend`（留给需要并发取数的 Check），CLI 用 `runBlocking` 把它桥到同步 `main`。
+
+要在一条 Check 里并发跑两端，`coroutineScope { async { ... } }` 就够了，不必引入 Flow：
 
 ```kotlin
-import kotlinx.coroutines.flow.*
-
-suspend fun DiffEngine.keySetAsync(
-    src: Flow<Row>, tgt: Flow<Row>, key: String
-): Set<String> = coroutineScope {
-    val s = src.map { it.string(key)!! }.toSetIn(this)
-    val t = tgt.map { it.string(key)!! }.toSetIn(this)
-    s + t                              // 或 s intersect t，看语义
+override suspend fun Ctx.run() = coroutineScope {
+    val srcAgg = async { src.query(srcSql) }
+    val tgtAgg = async { tgt.query(tgtSql) }
+    diff.aggregate(srcAgg.await(), tgtAgg.await(), keys = listOf("dt"))
 }
-
-private suspend fun <T> Flow<T>.toSetIn(scope: CoroutineScope): Set<T> = scope.async {
-    toList().toSet()
-}.await()
 ```
 
-`Closeable` 资源放进 `CloseableCoroutineScope` 或 `use { }` 模板，不要裸起 `GlobalScope`。
+注意 `DiffEngine` 的计数器不是线程安全的（见 §10），并发只在「取数」这一层做，别把同一次
+对账的 `aggregate` / `compareRows` 拆到多个协程里。
 
 ### 4.7 构造：命名参数 + 默认值
 
@@ -330,10 +327,12 @@ inline fun <reified T : Check> CheckRegistry.register() {
 不要抛裸 `SQLException` 一路冒泡。用 `runCatching` + 领域错误。
 
 ```kotlin
-sealed interface ConnectorError : Throwable {
-    val sql: String
-    data class QueryFailed(override val sql: String, override val cause: Throwable) : ConnectorError
-    data class TypeCoercion(val column: String, val from: String, val to: String) : ConnectorError {
+// Kotlin 的 interface 不能 extends Throwable（Throwable 是 open class），所以用 sealed class：
+// when 的穷尽性与 sealed interface 等价，代价是子类共享 RuntimeException 这条继承链。
+sealed class ConnectorError : RuntimeException() {
+    abstract val sql: String
+    data class QueryFailed(override val sql: String, override val cause: Throwable) : ConnectorError()
+    data class TypeCoercion(val column: String, val from: String, val to: String) : ConnectorError() {
         override val sql get() = "<type-coercion>"
     }
 }
@@ -345,51 +344,60 @@ inline fun <T> Connector.guard(sql: String, block: () -> T): T =
 ### 4.9 Check 主体：全是 Kotlin 习惯
 
 ```kotlin
-object OrderSyncCheck : Check("order_sync") {
+object UserSyncCheck : CheckBase("user_sync") {
+    @Volatile var alertUrl = System.getenv("ALERT_URL") ?: ""
+
     override suspend fun Ctx.run() {
         val dt = args.dt
-        val src = ParquetConnector("/data/orders/dt=$dt/part-0.parquet")
-        val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))
+        ParquetConnector("/data/users/dt=$dt/part-0.parquet").use { src ->
+            ParquetConnector("/data/users_tgt/dt=$dt/part-0.parquet").use { tgt ->
+                // L1：聚合粗筛（SUM 列挂容忍度，与 L3 同一套规则）
+                diff.aggregate(
+                    src.query("SELECT '$dt' AS dt, COUNT(*) AS c, SUM(amount) AS s FROM read_parquet('…')"),
+                    tgt.query("SELECT '$dt' AS dt, COUNT(*) AS c, SUM(amount) AS s FROM read_parquet('…')"),
+                    keys = listOf("dt"),
+                ) {
+                    field("s") { tolerance(abs = 0.01) }
+                }
 
-        // L1：行数 + 合计 + checksum
-        val aggDiffs = diff.aggregate(
-            src  query "SELECT '$dt' ccount, count(*) c, sum(amount) s, sum(hash(...)) h FROM read_parquet('/data/orders/dt=$dt/*.parquet')",
-            tgt  query "SELECT dt, count(*) c, sum(amount) s, sum(fnv_hash(...)) h FROM ods.orders WHERE dt='$dt' GROUP BY dt",
-            keys = listOf("dt")
-        )
+                // L2：主键集合差集（惰性；toList() 必须消费，否则 keyDiffCount 不累加）
+                val onlyOneSide: List<String> = diff.keySet(
+                    src = src.stream("SELECT order_id FROM read_parquet('…')"),
+                    tgt = tgt.stream("SELECT order_id FROM read_parquet('…')"),
+                    key = "order_id",
+                ).toList()
 
-        // L2：哈希桶采样，主键集合做差（惰性）
-        val keySet = with(aggDiffs.first()) {
-            diff.keySet(
-                src  stream "SELECT order_id FROM read_parquet('/data/orders/dt=$dt/*.parquet') WHERE hash(order_id)%100 < ${ratio(1)}" mapBy "order_id",
-                tgt  stream "SELECT order_id FROM ods.orders WHERE dt='$dt' AND fnv_hash(order_id)%100 < ${ratio(1)}" mapBy "order_id"
-            ).toList()
-        }
-
-        // L3：行级 diff + 顶层 N 抽样（协程并发拉两侧）
-        keySet.take(1000).forEachParallel { key ->
-            val s = src.one(...) ?: return@forEachParallel
-            val t = tgt.one(...) ?: return@forEachParallel
-            diff.compare(s, t) {
-                "amount"       field by tolerance(abs = 0.01)
-                "updated_at"   field by toUtc
-                "status"       field by ignore()
-                "phone"        field by phoneNumber()
+                // L3：行级细比（ORDER BY 保证抽样子集确定）
+                diff.compareRows(
+                    src = src.stream("SELECT order_id, amount, updated_at, status, phone FROM read_parquet('…') ORDER BY order_id LIMIT 1000"),
+                    tgt = tgt.stream("SELECT order_id, amount, updated_at, status, phone FROM read_parquet('…') ORDER BY order_id LIMIT 1000"),
+                    key = { row -> row["order_id"] ?: error("missing order_id column") },
+                    check = { s, t ->
+                        diff.compare(s, t) {
+                            field("amount")     by tolerance(abs = 0.01)
+                            field("updated_at") by toUtc
+                            field("status")     by ignore()
+                            field("phone")      by phoneNumber()
+                        }
+                    },
+                ).toList()
             }
         }
 
-        report.excel("reports/order_sync.xlsx", diff.summary())
-        diff.summary().takeIf { it.hasDiff }?.let { report.webhook(env("ALERT_URL"), it) }
+        val summary = diff.summary()
+        report.excel("reports/user_sync_$dt.xlsx", summary)
+        report.webhook(alertUrl, summary)
     }
 }
-
-// 顶层内联中缀：把 SQL 串成一句
-infix fun Connector.query(sql: String): List<Row> = query(sql)
-infix fun Connector.stream(sql: String): Sequence<Row> = stream(sql)
-inline infix fun <T> Sequence<T>.mapBy(getter: String): Sequence<String> = mapNotNull { it.string(getter) }
-inline infix fun <T> Iterable<T>.forEachParallel(crossinline block: suspend (T) -> Unit) =
-    runBlocking { map { async { block(it) } }.awaitAll() }
 ```
+
+上面用到的都是库里**真实存在**的 API：`CheckBase` / `Ctx.run` / `args.dt`、
+`Connector.query` / `stream` / `one`、`DiffEngine.aggregate` / `keySet` / `compareRows` / `compare` /
+`summary`、`FieldRules` 的 `field { … }` 与 `field … by …` 两种写法、`Report.excel` / `webhook`。
+
+不要为此自造中缀工具（例如 `infix fun Connector.query(sql: String) = query(sql)` 这种自递归包装，
+或 `mapBy` / `forEachParallel` 之类）：`FieldRules.field` 已经是 infix，取列值用
+`row.string("x")` / `row.decimal("x")` 这类扩展属性即可；并发取数见 §4.6。
 
 ### 4.10 风格红线
 
@@ -417,41 +425,16 @@ DuckDB 读 Parquet，row group 流式扫描，不依赖 JDBC 游标参数。
 ```kotlin
 class ParquetConnector(
     private val path: String,
-    private val memoryLimit: String = "4GB",
-    private val tempDir: String = "/tmp/duckdb_spill"
-) : Connector {
-
-    private val conn: Connection = DriverManager.getConnection("jdbc:duckdb:").apply {
-        autoCommit = false
-        createStatement().use { st ->
-            st.execute("SET memory_limit = '$memoryLimit'")
-            st.execute("SET temp_directory = '$tempDir'")
-            if (path.startsWith("s3://") || path.startsWith("oss://")) {
-                st.execute("INSTALL httpfs; LOAD httpfs;")
-            }
-        }
-    }
-
-    override fun query(sql: String): List<Row> =
-        conn.prepareStatement(sql).use { st ->
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        conn.prepareStatement(sql).use { st ->
-            st.executeQuery().use { rs ->
-                while (rs.next()) yield(rs.toRow())
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() = conn.close()
-}
+    private val memoryLimit: String = "1GB",
+    private val tempDir: String = "/tmp/duckdb_spill",
+) : DuckDbSessionConnector(memoryLimit, tempDir, httpfsFor(path))
 ```
 
 > 注：生产里 `sql` 参数须用参数化预编译或经白名单校验；演示 SQL 采用字符串拼接只为简洁。
+
+`query` / `stream` / `one` / `close` 由基类 `DuckDbSessionConnector` 实现（`guard` 失败包装、
+扩展加载、服务端游标逐行 `yield`），本类只声明「读 Parquet」；`path` 只用于判断是否
+`s3://` / `oss://`（决定要不要加载 httpfs），真正读哪些文件由 Check 的 SQL 决定。
 
 ### 5.2 CsvConnector
 
@@ -469,29 +452,38 @@ CsvConnector("/data/orders/2026-09-01.csv").use { src ->
 
 ```kotlin
 ExcelConnector("/data/orders/2026-09-01.xlsx").use { src ->
-    src.stream("SELECT * FROM st_read('$path')").take(1000).toList()
+    src.stream("SELECT * FROM read_xlsx('$path')").take(1000).toList()
 }
 ```
+
+函数名是 `read_xlsx`（`excel` 扩展提供，另有 `sheet` / `header` / `range` 等参数），
+不是 `st_read`——那是 spatial 扩展的函数。
 
 ### 5.4 JsonlConnector
 
-使用 DuckDB `read_jsonl`，每行一个 JSON 对象自动解析。
+使用 DuckDB 的 JSON 扩展，每行一个 JSON 对象自动解析。
 
 ```kotlin
 JsonlConnector("/data/orders/2026-09-01.jsonl").use { src ->
-    src.stream("SELECT * FROM read_jsonl('$path')").take(1000).toList()
+    src.stream("SELECT * FROM read_ndjson_auto('$path')").take(1000).toList()
 }
 ```
 
+DuckDB 没有 `read_jsonl` 这个函数（实测 1.5.5.1 有 `read_json` / `read_json_auto` /
+`read_ndjson` / `read_ndjson_auto` / `read_json_objects*` / `read_ndjson_objects`）。
+按行分隔的 JSONL 用 `read_ndjson_auto`；整个文件当一个 JSON 值解析用 `read_json_auto`。
+
 ### 5.5 共享特性
 
-所有 DuckDB 文件连接器共用同一套构造模式：
+所有 DuckDB 文件连接器共用同一个基类 `DuckDbSessionConnector`（不再是"各写一遍的构造模式"）：
 
-- `jdbc:duckdb:` in-process 引擎，构造期建连
-- `autoCommit = false`，显式事务持有会话配置
+- `jdbc:duckdb:` in-process 引擎，构造期建连，`autoCommit = false` 持有会话配置
 - `memory_limit` / `temp_directory` 可配置
-- S3/OSS：`s3://` / `oss://` 路径自动 `INSTALL/LOAD httpfs`
-- `stream()` 服务端游标逐行 `yield`，JVM 堆只保留一行
+- 需要的扩展由子类在 super 调用里声明：S3/OSS 路径自动 `INSTALL/LOAD httpfs`，
+  `ExcelConnector` 额外加载 `excel`
+- `query` / `stream` / `one` / `close` 只在基类实现一次：失败一律抛 `ConnectorError.QueryFailed`
+  （`guard` 写在 `sequence { }` 内部），`stream()` 服务端游标逐行 `yield`，JVM 堆只保留一行
+- 每个源类只剩构造参数 + 一句 `super(...)`，加新源不会再抄一遍取数逻辑
 
 ### 5.6 交付物与周期
 
@@ -516,25 +508,31 @@ JsonlConnector("/data/orders/2026-09-01.jsonl").use { src ->
 
 ### 6.1 DuckDB 连接器
 
-共用同一个 `jdbc:duckdb:` in-process 引擎，读文件不额外占用 JVM 堆。`DuckDBConnector` 允许用户在 `setupSql` 中附加任意外部数据源（PostgreSQL / MySQL / SQLite / 其他 DuckDB），实现跨源 SQL 查询。
+共用同一个 `jdbc:duckdb:` in-process 引擎与同一个基类 `DuckDbSessionConnector`（实现只写一份），读文件不额外占用 JVM 堆。`DuckDBConnector` 允许用户在 `setupSql` 中附加任意外部数据源（PostgreSQL / MySQL / SQLite / 其他 DuckDB），实现跨源 SQL 查询。
 
 | 连接器 | DuckDB 函数 | 说明 |
 |:---|:---|:---|
 | `ParquetConnector` | `read_parquet` | Parquet 文件，row group 流式 |
 | `CsvConnector` | `read_csv_auto` | CSV / TSV，自动推断类型 |
-| `ExcelConnector` | `st_read`（excel 扩展） | `.xlsx`，需 `INSTALL/LOAD excel` |
-| `JsonlConnector` | `read_jsonl` | JSONL（每行一个 JSON 对象） |
+| `ExcelConnector` | `read_xlsx`（excel 扩展） | `.xlsx`，需 `INSTALL/LOAD excel` |
+| `JsonlConnector` | `read_ndjson_auto` | JSONL（每行一个 JSON 对象） |
 | `DuckDBConnector` | 用户自定义 `ATTACH` | 多数据源 `ATTACH`（PG/MySQL/SQLite/DuckDB），跨源 SQL 查询 |
 
 S3/OSS：路径含 `s3://` / `oss://` 时自动 `INSTALL/LOAD httpfs`。
 
 ### 6.2 JDBC 连接器
 
+共用同一个基类 `JdbcConnector`：`query` / `stream` / `one` / `close` 只实现一份，失败一律抛
+`ConnectorError.QueryFailed`（**含 `stream`**），各源只负责建连与方言差异（`one()` 的 `LIMIT 1`
+在 SQL Server 上换成 `SELECT TOP 1`）。每个连接器在建连前显式 `Class.forName(自己的驱动)`，
+不依赖 fat jar 里被合并的 `META-INF/services/java.sql.Driver`——那条链一旦有驱动加载不了，
+排在它后面的全失效。
+
 | 连接器 | JDBC URL 前缀 | 关键参数 | 陷阱 |
 |:---|:---|:---|:---|
-| `ImpalaConnector` | `jdbc:hive2://` | `autoCommit=false` + `fetchSize=10000` | Kerberos 票据需预先存在（hive-jdbc 驱动） |
+| `ImpalaConnector` | `jdbc:hive2://` | `autoCommit=false` + `fetchSize=10000` | 驱动是 `hive-jdbc:4.1.0:standalone`（见 §13）；Kerberos 票据需预先存在 |
 | `PgConnector` | `jdbc:postgresql://` | `autoCommit=false` + `fetchSize=10000` | 不关 autoCommit 会全量拉回 |
-| `MySQLConnector` | `jdbc:mysql://` | `autoCommit=false` + `fetchSize=10000` | `useCursorFetch=true` |
+| `MySQLConnector` | `jdbc:mysql://` | `autoCommit=false` + `fetchSize=10000` | **URL 必须带 `useCursorFetch=true`**，否则驱动全量拉回 |
 | `MSSQLConnector` | `jdbc:sqlserver://` | `autoCommit=false` + `fetchSize=10000` | 默认全缓冲 |
 | `ClickHouseConnector` | `jdbc:clickhouse://` | `autoCommit=false` + `fetchSize=10000` | — |
 | `MaxComputeConnector` | `jdbc:odps:` | 无事务，JDBC 直连 | 类型映射非标准 |
@@ -543,55 +541,61 @@ S3/OSS：路径含 `s3://` / `oss://` 时自动 `INSTALL/LOAD httpfs`。
 ## 7. Check 示例（阶段 1）
 
 ```kotlin
-object OrderSyncCheck : Check("order_sync") {
-    override fun Ctx.run() {
+object OrderSyncCheck : CheckBase("order_sync"), Alertable {
+    @Volatile var parquetPath = System.getenv("ORDERS_PARQUET_PATH") ?: "/tmp/orders.parquet"
+    @Volatile var tgtParquetPath = System.getenv("ORDERS_TGT_PARQUET_PATH") ?: parquetPath
+    @Volatile override var alertUrl = System.getenv("ALERT_URL") ?: ""
+
+    override suspend fun Ctx.run() {
         val dt = args.dt
-        val src = ParquetConnector("/data/orders/dt=$dt/part-0.parquet")
-        val tgt = ImpalaConnector(ImpalaConfig.fromEnv(ImpalaConfig.DEFAULT))
+        ParquetConnector(parquetPath).use { s ->
+            ParquetConnector(tgtParquetPath).use { t ->
+                // L1 聚合：行数、金额和、主键哈希和；SUM 列必须挂容忍度，否则行级容忍的漂移会在 L1 误报
+                val srcAgg = s.query(
+                    "SELECT '$dt' AS dt, COUNT(*) AS c, SUM(amount) AS s, " +
+                        "SUM(hash(order_id)) AS h FROM read_parquet('$parquetPath')"
+                )
+                val tgtAgg = t.query(
+                    "SELECT '$dt' AS dt, COUNT(*) AS c, SUM(amount) AS s, " +
+                        "SUM(hash(order_id)) AS h FROM read_parquet('$tgtParquetPath')"
+                )
+                diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt")) {
+                    field("s") { tolerance(abs = 0.01) }
+                }
 
-        // L1 聚合：行数、合计、checksum
-        val srcAgg = src.query("""
-            SELECT '$dt' AS dt, COUNT(*) AS c, SUM(amount) AS s,
-                   SUM(hash(concat_ws('|', order_id, amount, status))) AS h
-            FROM read_parquet('/data/orders/dt=$dt/*.parquet')
-        """)
-        val tgtAgg = tgt.query("""
-            SELECT dt, COUNT(*) AS c, SUM(amount) AS s,
-                   SUM(fnv_hash(concat_ws('|', order_id, amount, status))) AS h
-            FROM ods.orders WHERE dt = '$dt' GROUP BY dt
-        """)
-        val aggDiffs = diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt"))
+                // L2 主键集合差集：序列必须消费（toList / forEach），否则 keyDiffCount 不累加
+                val onlyOneSide: List<String> = diff.keySet(
+                    src = s.stream("SELECT order_id FROM read_parquet('$parquetPath')"),
+                    tgt = t.stream("SELECT order_id FROM read_parquet('$tgtParquetPath')"),
+                    key = "order_id",
+                ).toList()
 
-        // L2 主键集合（按哈希桶采样）
-        aggDiffs.map { it.key("dt") }.forEach { d ->
-            val srcKeys = src.stream("""
-                SELECT order_id FROM read_parquet('/data/orders/dt=$d/*.parquet')
-                WHERE hash(order_id) % 100 < ${ratio(1)}
-            """)
-            val tgtKeys = tgt.stream("""
-                SELECT order_id FROM ods.orders
-                WHERE dt = '$d' AND fnv_hash(order_id) % 100 < ${ratio(1)}
-            """)
-            diff.keySet(srcKeys, tgtKeys, key = "order_id")
-        }
-
-        // L3 行级 diff（仅前 1000 条）
-        diff.diffKeys().take(1000).forEach { key ->
-            val s = src.one("""
-                SELECT * FROM read_parquet('/data/orders/dt=$dt/*.parquet')
-                WHERE order_id = '$key'
-            """) ?: return@forEach
-            val t = tgt.one("SELECT * FROM ods.orders WHERE order_id = '$key'") ?: return@forEach
-            diff.compare(s, t) {
-                field("amount")     { tolerance(abs = 0.01) }
-                field("updated_at") { toUtc }      // toUtc 是属性，不加括号
-                field("status")     { ignore() }
-                field("phone")      { phoneNumber() } // 自定义扩展
+                // L3 行级：ORDER BY 让抽样子集确定；key 取不到直接失败（缺列 / NULL 主键不静默跳过）
+                diff.compareRows(
+                    src = s.stream(
+                        "SELECT order_id, amount, status FROM read_parquet('$parquetPath') " +
+                            "ORDER BY order_id LIMIT 1000"
+                    ),
+                    tgt = t.stream(
+                        "SELECT order_id, amount, status FROM read_parquet('$tgtParquetPath') " +
+                            "ORDER BY order_id LIMIT 1000"
+                    ),
+                    key = { row -> row["order_id"] ?: error("missing order_id column") },
+                    check = { a, b ->
+                        diff.compare(a, b) {
+                            field("amount")     { tolerance(abs = 0.01) }
+                            field("updated_at") { toUtc }      // toUtc 是属性，不加括号
+                            field("status")     { ignore() }
+                            field("phone")      { phoneNumber() }
+                        }
+                    },
+                ).toList()
             }
         }
 
-        report.excel("reports/order_sync.xlsx", diff.summary())
-        if (diff.summary().hasDiff) report.webhook(env("ALERT_URL"), diff.summary())
+        val summary = diff.summary()
+        report.excel("reports/order_sync_$dt.xlsx", summary)
+        report.webhook(alertUrl, summary)   // alertUrl 为空串时内部直接 no-op
     }
 }
 ```
@@ -606,7 +610,7 @@ val src = ParquetConnector("/data/orders/dt=2026-09-01/part-0.parquet")   // Duc
 val tgt = ImpalaConnector(myImpalaConfig)                                // Hive JDBC
 
 // 阶段 2+
-val srcPg = PostgresConnector("jdbc:postgresql://host:5432/orders")
+val srcPg = PgConnector(PgConfig("jdbc:postgresql://host:5432/orders"))
 ```
 
 不设 `ConnectorFactory` 之类的"统一入口"：那种类最终只会是一堆
@@ -623,10 +627,10 @@ val srcPg = PostgresConnector("jdbc:postgresql://host:5432/orders")
 |:---|:---|:---|
 | Parquet `TIMESTAMP` | `Instant(UTC)` | Parquet 自带 schema，归一最简 |
 | Parquet `DECIMAL` | `BigDecimal` | 保精度 |
-| PG `TIMESTAMPTZ` | `Instant(UTC)` | 直接转 |
-| MySQL `DATETIME` | `Instant(UTC)` | 按源默认时区转 |
+| PG `TIMESTAMPTZ` | `Instant(UTC)` | 带偏移型按其自身偏移归一 |
+| MySQL `DATETIME` | `Instant(UTC)` | naive 型一律**按 UTC 解释**（不吃 JVM 默认时区） |
 | MSSQL `DATETIMEOFFSET` | `Instant(UTC)` | 带偏移归一 |
-| MaxCompute `DATETIME` | `Instant(UTC)` | 默认 UTC+8 转 UTC |
+| MaxCompute `DATETIME` | `Instant(UTC)` | 同上：naive 按 UTC 解释，**不做 +8 转换** |
 | 字符串 | `String(UTF-8)` | 统一编码 |
 | NULL | `null` | 统一 |
 
@@ -634,27 +638,30 @@ val srcPg = PostgresConnector("jdbc:postgresql://host:5432/orders")
 
 - **Parquet 侧**：DuckDB `read_parquet` 按 row group 流式扫描；`memory_limit` + `temp_directory` 兜底 spill。
 - **JDBC 侧**：所有 `stream()` 走服务端游标、逐行 `Sequence yield`；`query()` 只用于小结果集。
-- **DiffEngine**：
-  - L1 聚合：O(分区数)，全量进内存。
-  - L2 主键集合：流式归并，O(1) 额外内存。
-  - L3 行级：逐行比对，O(1)。
-  - 差异样本：top-N 有界队列。
+- **DiffEngine**（与 `DiffEngine` 的 KDoc、各档签名一致）：
+  - L1 `aggregate(List<Row>, List<Row>)`：两侧聚合结果全量物化成 `Map`，额外内存 O(分区数)。
+  - L2 `keySet(Sequence<Row>, Sequence<Row>)`：两侧各扫一遍、去重后进 `LinkedHashSet`，
+    额外内存 O(两端去重键数之和)。键基数极大时先用 SQL 的 `WHERE hash(k) % 100 < n` 压量。
+  - L3 `compareRows(Sequence<Row>, Sequence<Row>)`：`src` 整条流进 `HashMap`（O(src 行数)），
+    外加 tgt 去重键集合（O(tgt 去重键数)）。适合「一侧可控、一侧很大」。
+  - 没有「差异样本 top-N 有界队列」这类结构：差异是惰性 `Sequence`，保留多少由调用方
+    `take(n)` / `toList()` 决定。
 
 ## 11. 自定义校验
 
 ### 11.1 字段规则（扩展函数）
 
 ```kotlin
-fun FieldRules.phoneNumber() = add { s, t ->
-    val a = s as? String ?: return@add false
-    val b = t as? String ?: return@add false
-    a.replace(Regex("\\D"), "") == b.replace(Regex("\\D"), "")
+// 约定：规则就是 (Any?, Any?) -> Boolean 的 lambda（src 值, tgt 值）→ 是否算相等；
+// 扩展函数挂在 FieldRules 上只是为了名字与发现性，仓库里的 phoneNumber / amountWithTax 就这么写。
+fun FieldRules.phoneNumber(): (Any?, Any?) -> Boolean = { s, t ->
+    (s as? String)?.filter(Char::isDigit) == (t as? String)?.filter(Char::isDigit)
 }
 
-fun FieldRules.amountWithTax(rate: BigDecimal) = add { s, t ->
-    val a = s as? BigDecimal ?: return@add false
-    val b = t as? BigDecimal ?: return@add false
-    a.multiply(rate) == b
+fun FieldRules.amountWithTax(rate: BigDecimal): (Any?, Any?) -> Boolean = { s, t ->
+    val a = s as? BigDecimal
+    val b = t as? BigDecimal
+    a != null && b != null && a.multiply(rate).compareTo(b) == 0
 }
 ```
 
@@ -674,13 +681,25 @@ diff.compare(s, t) {
 ### 11.3 整行校验
 
 ```kotlin
-diff.compareRows(srcStream, tgtStream, key = { it["order_id"] }) { s, t ->
-    buildList {
-        if (s.decimal("amount") * BigDecimal("1.06") != t.decimal("amount_taxed"))
-            add(FieldDiff("amount_taxed", s["amount"], t["amount_taxed"]))
-    }
-}
+diff.compareRows(
+    src = srcStream,
+    tgt = tgtStream,
+    key = { it["order_id"] ?: error("missing order_id") },
+    check = { s, t ->
+        val expected = s.decimal("amount")?.multiply(BigDecimal("1.06"))
+        val actual = t.decimal("amount_taxed")
+        if (expected?.compareTo(actual) == 0) {
+            listOf(FieldDiff.Equal)
+        } else {
+            listOf(FieldDiff.Mismatch("amount_taxed", expected, actual))
+        }
+    },
+).toList()
 ```
+
+`FieldDiff` 是 `sealed interface`（`Equal` / `Mismatch(field, expected, actual)` /
+`Missing(field, side)`），没有位置参数构造；`compareRows` 的 `check` 是命名参数
+`(Row, Row) -> List<FieldDiff>`，不是尾随 lambda。
 
 ## 12. 数据流
 
@@ -711,16 +730,26 @@ sequenceDiagram
 | JDK | 编译 / 运行 / 构建 JVM | 17（Gradle 9 本身要求 ≥17，构建前 `JAVA_HOME` 必须指向 JDK 17） |
 | 构建 | Gradle 多模块 + Shadow Fat JAR | Gradle 9.7.1 + Shadow 9.6.1 |
 | CLI | Clikt | 5.1.0 |
-| 并发 | Kotlin 协程 + Flow | kotlinx-coroutines 1.11.0 |
+| 并发 | Kotlin 协程（仅 CLI 的 `runBlocking`；无 Flow） | kotlinx-coroutines 1.11.0 |
 | 上游阶段 1 | DuckDB JDBC 读 Parquet | duckdb_jdbc 1.5.5.1 |
-| 下游 | Impala Hive JDBC | ImpalaJDBC41 2.6.4 |
+| 下游 | Impala（HiveServer2 协议） | `hive-jdbc:4.1.0:standalone`（见下） |
 | 上游阶段 2+ | 各源 JDBC 驱动 | — |
 | 报告 | Excel / Webhook | Excel 由 `XlsxWriter` 手写最小 OOXML（`java.util.zip`），零额外依赖；Webhook 用 JDK `HttpURLConnection` |
 | 调度 | Airflow / DolphinScheduler 触发 CLI | — |
 
-> Fat JAR 开了 `failOnDuplicateEntries = true` 严格模式：依赖树里出现重复条目直接构建失败。
-> 当前唯一需要合并的是 jna / ImpalaJDBC41 各带一份的 `META-INF/LICENSE|NOTICE|DEPENDENCIES`，
-> 由 `append(...)` 追加合并而非丢弃。
+> Fat JAR 关掉了重复条目的严格失败（`failOnDuplicateEntries = false`）：同名 class 在多个 transitive
+> 里各带一份（kotlin-stdlib、lz4-java…）内容一致，运行时不存在冲突；法务元数据
+> （`META-INF/LICENSE|NOTICE|DEPENDENCIES`）用 `append(...)` 追加合并而非丢弃。
+>
+> **Hive JDBC 必须停在 `4.1.0:standalone`**（不是 4.2.x）：4.2.x 的 `HiveDriver` 是 Java 21
+> 字节码，JDK 17 上直接 `UnsupportedClassVersionError`；更麻烦的是它在合并后的
+> `META-INF/services/java.sql.Driver` 里排第二，驱动注册扫描会在那条中断，导致 JDK 17 下
+> H2 / MySQL / MSSQL / PG / ClickHouse / MaxCompute 全部报 "No suitable driver found"。
+> `standalone` 变体也是必需的：hive-jdbc 普通 jar 的 POM 只声明 test 依赖，手工拼
+> `hive-service-rpc` / `hive-service` / `hive-common` / `hadoop-client-*` 会一路漏类（thrift、
+> TCLIService、HiveSQLException、HiveConf、`org.apache.hadoop.shaded.*`、curator…）。代价是这个
+> jar 约 48 MB / 4.5 万条目，所以 `shadowJar` 开了 `isZip64 = true`。另外每个 JDBC 连接器都会在
+> 建连前 `Class.forName(自己的驱动)`，任何驱动加载不了都不会再连带弄坏其它驱动。
 
 ## 14. 实施计划
 
@@ -767,23 +796,25 @@ sync_diff/
 │       │   ├── core/         # Row / FieldDiff / DiffRow / DiffSummary / Connector
 │       │   │                 # ConnectorError / FieldRules(DSL) / SequenceExt
 │       │   ├── engine/       # DiffEngine（L1 聚合 / L2 主键集合 / L3 行级）
-│       │   ├── connectors/   # DuckDB文件: Parquet/Csv/Excel/Jsonl; JDBC: Impala/Pg/MySQL/MSSQL/ClickHouse/MaxCompute/H2; ResultSetExt
+│       │   ├── connectors/   # 基类: DuckDbSessionConnector / JdbcConnector
+│       │   │                 # DuckDB 文件源: Parquet/Csv/Excel/Jsonl/DuckDB；JDBC 源: Impala/Pg/MySQL/MSSQL/ClickHouse/MaxCompute/H2
+│       │   │                 # ResultSetExt（类型归一）
 │       │   └── reporter/     # Reporter（Excel + Webhook）
 │       └── test/kotlin/com/kxxnzstdsw/sync_diff/    # 与 main 同构
 ├── checks/
 │   ├── build.gradle.kts
 │   └── src/
-│       ├── main/java/com/kxxnzstdsw/sync_diff/
+│       ├── main/kotlin/com/kxxnzstdsw/sync_diff/
 │       │   ├── check/        # Check / Ctx / CheckBase / Alertable / CheckRegistry / BuiltinCheck
 │       │   └── checks/       # 具体对账：OrderSyncCheck（@BuiltinCheck，启动期注解扫描注册）
-│       └── test/java/com/kxxnzstdsw/sync_diff/      # 与 main 同构
+│       └── test/kotlin/com/kxxnzstdsw/sync_diff/    # 与 main 同构
 └── app/
     ├── build.gradle.kts      # shadowJar + Main-Class 在这里
-    └── src/main/java/com/kxxnzstdsw/sync_diff/Main.kt   # SyncDiffCli（Clikt 入口）
+    └── src/main/kotlin/com/kxxnzstdsw/sync_diff/Main.kt   # SyncDiffCli（Clikt 入口）
 ```
 
-> `checks` / `app` 的 Kotlin 源码放在 `src/main/java` 下（Kotlin 插件同样编译该目录），
-> `core` 用的是 `src/main/kotlin`。新增文件时跟随所在模块现有的目录约定即可。
+> 三个模块统一用 `src/main/kotlin`；根 `build.gradle.kts` 集中声明 Kotlin 插件版本、toolchain 17、
+> 仓库与 `useJUnitPlatform()`，各模块只保留自己的依赖。
 >
 > 可执行产物在 `app/build/libs/sync_diff-all.jar`（不是根目录的 `build/libs`）。
 

@@ -4,14 +4,6 @@ import com.kxxnzstdsw.sync_diff.check.Alertable
 import com.kxxnzstdsw.sync_diff.check.BuiltinCheck
 import com.kxxnzstdsw.sync_diff.check.CheckBase
 import com.kxxnzstdsw.sync_diff.check.Ctx
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.defaultConnectors
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.defaultRules
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.ignoreAny
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.l1Rules
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.srcL1Sql
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.srcL3Sql
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.tgtL1Sql
-import com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck.tgtL3Sql
 import com.kxxnzstdsw.sync_diff.connectors.ParquetConnector
 import com.kxxnzstdsw.sync_diff.core.Connector
 import com.kxxnzstdsw.sync_diff.core.DiffSummary
@@ -42,8 +34,9 @@ import kotlin.math.abs
  * emit `Missing("<row>", Side.SRC/TGT)`，「缺行」已经由 L3 覆盖。
  *
  * 两个取舍：
- * - 取数带 `LIMIT $take`（默认 1000，见 [runCheck]）：行级比对要把 src 装进内存，
- *   先限量保证「跑得起来」；全量下钻留待后续阶段。
+ * - 取数带 `ORDER BY order_id LIMIT $take`（默认 1000，见 [runCheck]）：行级比对要把 src 装进内存，
+ *   先限量保证「跑得起来」；全量下钻留待后续阶段。`ORDER BY` 保证这 $take 行是**确定的**子集，
+ *   同一份数据两次运行样到同一批主键（否则 `LIMIT` 取哪几行由扫描顺序决定，结论不可回归）。
  * - 只有 `order_id` / `amount` / `status` 进 SQL：`updated_at` / `dt` 不取也不比，
  *   想扩列就同时改 [srcL3Sql] / [tgtL3Sql] 与 [defaultRules]。
  *
@@ -176,17 +169,23 @@ object OrderSyncCheck : CheckBase("order_sync"), Alertable {
             "SUM(hash(order_id)) AS h FROM read_parquet('$tgtParquetPath')"
 
     /**
-     * L3 上游明细：只取参与比对的 `order_id` / `amount` / `status`，`LIMIT $take` 限量。
+     * L3 上游明细：只取参与比对的 `order_id` / `amount` / `status`，`ORDER BY order_id LIMIT $take` 限量。
+     *
+     * `ORDER BY` 不是装饰：`LIMIT` 没有排序时取哪 $take 行由扫描顺序决定（多 part / 并行扫描下
+     * 不保证稳定），两次运行会样到不同子集，报告结论不可回归。带上 `ORDER BY` 后抽样是确定的
+     * 「最小的 $take 个 order_id」，两端也按同一顺序对齐。
      *
      * `dt` 参数当前未拼进 SQL——L3 靠 `order_id` 对齐、分区过滤交给文件路径；保留参数只为
      * 与 [tgtL3Sql] 保持同一签名（后续按分区改写 SQL 时直接可用）。
      */
     private fun srcL3Sql(dt: String, take: Int): String =
-        "SELECT order_id, amount, status FROM read_parquet('$parquetPath') LIMIT $take"
+        "SELECT order_id, amount, status FROM read_parquet('$parquetPath') " +
+            "ORDER BY order_id LIMIT $take"
 
-    /** L3 下游明细：列与 [srcL3Sql] 一致，只换数据源（同上，`dt` 暂未使用）。 */
+    /** L3 下游明细：列与 [srcL3Sql] 一致（含 `ORDER BY`），只换数据源（同上，`dt` 暂未使用）。 */
     private fun tgtL3Sql(dt: String, take: Int): String =
-        "SELECT order_id, amount, status FROM read_parquet('$tgtParquetPath') LIMIT $take"
+        "SELECT order_id, amount, status FROM read_parquet('$tgtParquetPath') " +
+            "ORDER BY order_id LIMIT $take"
 
     // -------- 私有：字段规则 lambda --------
     //

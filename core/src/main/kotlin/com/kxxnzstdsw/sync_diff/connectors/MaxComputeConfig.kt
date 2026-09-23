@@ -1,15 +1,15 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
-import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.DriverManager
+import java.util.Properties
+
+private const val MAXCOMPUTE_DRIVER: String = "com.aliyun.odps.jdbc.OdpsDriver"
+
 
 /**
  * MaxCompute 连接配置。
  *
  * JDBC URL 形态：`jdbc:odps:http://service.cn-shanghai.maxcompute.aliyun.com/api`。
- * 需要配合 `aliyun.odps.jdbc.user` / `aliyun.odps.jdbc.password`（access key）。
+ *
  * ```kotlin
  * MaxComputeConfig(
  *     jdbcUrl = "jdbc:odps:http://service.cn-shanghai.maxcompute.aliyun.com/api",
@@ -19,7 +19,8 @@ import java.sql.DriverManager
  * )
  * ```
  *
- * 环境变量注入：[fromEnv] 是唯一的入口。
+ * 环境变量注入：[fromEnv] 是唯一的入口（`MAXCOMPUTE_JDBC_URL` / `MAXCOMPUTE_USER` /
+ * `MAXCOMPUTE_PASSWORD` / `MAXCOMPUTE_PROJECT` 全部必填，缺失即抛）。
  */
 data class MaxComputeConfig(
     val jdbcUrl: String,
@@ -44,16 +45,15 @@ data class MaxComputeConfig(
 /**
  * MaxCompute 连接器。
  *
- * 构造期建连；[stream] 使用 `fetchSize` 服务端游标逐行 yield。
- * MaxCompute JDBC 不支持 `autoCommit=false`，使用默认自动提交。
+ * 建连 / 取数 / 失败包装的公共实现见 [JdbcConnector]。两处 MaxCompute 特有的差异：
+ *
+ * - **不设 `autoCommit=false`**：ODPS JDBC 不支持显式事务，用默认自动提交（README §6）；
+ * - **project 走连接属性**：odps-jdbc 读的属性名是 `project_name`（URL 上的 `project` 等价），
+ *   由 [MaxComputeConnector] 的 [project] 参数下发——不配 project 时驱动会连到默认 project，
+ *   查询可能落到错误的库，所以**默认推荐用 [MaxComputeConfig] 构造**。
  *
  * ```kotlin
- * MaxComputeConnector(MaxComputeConfig(
- *     jdbcUrl = "jdbc:odps:http://service.cn-shanghai.maxcompute.aliyun.com/api",
- *     user = "access_key_id",
- *     password = "access_key_secret",
- *     project = "my_project",
- * )).use { conn ->
+ * MaxComputeConnector(MaxComputeConfig.fromEnv()).use { conn ->
  *     conn.query("SELECT * FROM orders WHERE dt = '2026-09-01'")
  * }
  * ```
@@ -62,36 +62,30 @@ class MaxComputeConnector(
     jdbcUrl: String,
     user: String,
     password: String,
-    private val fetchSize: Int = DEFAULT_FETCH_SIZE,
-) : Connector {
-
-    private val conn = DriverManager.getConnection(jdbcUrl, user, password)
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs ->
-                while (rs.next()) {
-                    yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() {
-        conn.close()
-    }
-
-    private companion object {
-        const val DEFAULT_FETCH_SIZE: Int = 10_000
-    }
+    fetchSize: Int = DEFAULT_FETCH_SIZE,
+    project: String? = null,
+) : JdbcConnector(
+    jdbcConnection(MAXCOMPUTE_DRIVER, jdbcUrl, user, password, maxComputeProperties(project)),
+    fetchSize,
+) {
+    /** 构造自 [MaxComputeConfig]：把 `project` 一并下发（推荐入口）。 */
+    constructor(cfg: MaxComputeConfig, fetchSize: Int = DEFAULT_FETCH_SIZE) : this(
+        jdbcUrl = cfg.jdbcUrl,
+        user = cfg.user,
+        password = cfg.password,
+        fetchSize = fetchSize,
+        project = cfg.project,
+    )
 }
+
+/**
+ * odps-jdbc 的 project 连接属性：属性名是 `project_name`（驱动 `ConnectionResource.PROJECT_PROP_KEY`，
+ * URL 上的写法是 `project=`）。[project] 为空时不下发，让驱动用自己的默认 project。
+ *
+ * 凭据不用操心的部分：[jdbcConnection] 下发的 `user` / `password` 正好是 access id / access key
+ * 的别名（`ACCESS_ID_PROP_KEY_ALT` / `ACCESS_KEY_PROP_KEY_ALT`），驱动会按别名识别。
+ */
+private fun maxComputeProperties(project: String?): Properties =
+    Properties().apply {
+        if (!project.isNullOrBlank()) setProperty("project_name", project)
+    }

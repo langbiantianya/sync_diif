@@ -34,28 +34,28 @@ import kotlinx.coroutines.runBlocking
  *
  * ## 用法
  *
- * 先 `./gradlew build shadowJar` 产出 `build/libs/sync_diff-all.jar`（`Main-Class` 见
- * `build.gradle.kts` 的 `shadowJar` 配置），然后：
+ * 先 `./gradlew build shadowJar` 产出 **`app/build/libs/sync_diff-all.jar`**（`Main-Class` 见
+ * `app/build.gradle.kts` 的 `shadowJar` 配置；注意不是根目录的 `build/libs`），然后：
  *
  * ```bash
  * # 1) 跑内置 Check：registry 文件不存在时自动 fallback 到内置 Check
- * java -jar build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
+ * java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
  *
  * # 2) 指定注册清单：每行一个 Check 子类的 FQCN，空行与 `#` 开头的注释行忽略
  * cat > checks.txt <<'EOF'
  * com.kxxnzstdsw.sync_diff.checks.OrderSyncCheck
  * EOF
- * java -jar build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20 --registry checks.txt
+ * java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20 --registry checks.txt
  *
  * # 3) 带告警地址：只有实现了 Alertable 的 Check 才会用到它
- * java -jar build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20 \
+ * java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20 \
  *     --alert-url https://hooks.example.com/sync-diff
  *
  * # 4) 下游连接信息走 Check 自己的 env/字段（CLI 不再兜底）：要切 Impala 集群就改 Check
- * #    实现里读的 env（Wilson 域默认读 `IMPALA_URL` / `IMPALA_USER` / `IMPALA_PASSWORD`）。
- * IMPALA_URL='jdbc:hive2://impala-prod:21050/default' \
+ * #    实现里读的 env（ImpalaConfig.fromEnv 读 IMPALA_JDBC_URL / IMPALA_USER / IMPALA_PASSWORD）。
+ * IMPALA_JDBC_URL='jdbc:hive2://impala-prod:21050/default' \
  * ALERT_URL='https://hooks.example.com/sync-diff' \
- *     java -jar build/libs/sync_diff-all.jar --check wilson_apply_detail_sync
+ *     java -jar app/build/libs/sync_diff-all.jar --check order_sync --dt 2026-09-20
  * ```
  *
  * ## 失败与 fallback

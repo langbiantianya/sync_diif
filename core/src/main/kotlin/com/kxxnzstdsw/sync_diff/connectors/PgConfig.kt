@@ -1,9 +1,7 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
-import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.DriverManager
+private const val PG_DRIVER: String = "org.postgresql.Driver"
+
 
 /**
  * PostgreSQL 连接配置。
@@ -14,7 +12,7 @@ import java.sql.DriverManager
  * PgConfig("jdbc:postgresql://pg-prod:5432/ods", "etl", "secret")
  * ```
  *
- * 环境变量注入：[fromEnv] 是唯一的入口。
+ * 环境变量注入：[fromEnv] 是唯一的入口（`PG_JDBC_URL` 必填，缺失即抛）。
  */
 data class PgConfig(
     val jdbcUrl: String,
@@ -34,7 +32,8 @@ data class PgConfig(
 /**
  * PostgreSQL 连接器。
  *
- * 构造期建连；[stream] 使用 `fetchSize` 服务端游标逐行 yield。
+ * 建连 / 取数 / 失败包装的公共实现见 [JdbcConnector]：构造期建连（连不上当场抛），
+ * `autoCommit = false` 让 [stream] 走服务端游标逐行 `yield`。
  *
  * ```kotlin
  * PgConnector(PgConfig("jdbc:postgresql://pg-prod:5432/ods")).use { conn ->
@@ -46,38 +45,16 @@ class PgConnector(
     jdbcUrl: String,
     user: String? = null,
     password: String? = null,
-    private val fetchSize: Int = DEFAULT_FETCH_SIZE,
-) : Connector {
-
-    private val conn = DriverManager.getConnection(jdbcUrl, user, password).also {
-        it.autoCommit = false
-    }
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        conn.prepareStatement(sql).use { st ->
-            st.fetchSize = fetchSize
-            st.executeQuery().use { rs ->
-                while (rs.next()) {
-                    yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() {
-        conn.close()
-    }
-
-    private companion object {
-        const val DEFAULT_FETCH_SIZE: Int = 10_000
-    }
+    fetchSize: Int = DEFAULT_FETCH_SIZE,
+) : JdbcConnector(
+    jdbcConnection(PG_DRIVER, jdbcUrl, user, password).also { it.autoCommit = false },
+    fetchSize,
+) {
+    /** 构造自 [PgConfig]：Check 里最常用的入口。 */
+    constructor(cfg: PgConfig, fetchSize: Int = DEFAULT_FETCH_SIZE) : this(
+        jdbcUrl = cfg.jdbcUrl,
+        user = cfg.user,
+        password = cfg.password,
+        fetchSize = fetchSize,
+    )
 }

@@ -2,20 +2,16 @@ package com.kxxnzstdsw.sync_diff.check
 
 import com.kxxnzstdsw.sync_diff.check.Check.Args
 import kotlinx.coroutines.runBlocking
-import kotlinx.datetime.LocalDate.Companion.Format
-import kotlinx.datetime.format
-import kotlinx.datetime.format.char
-import kotlinx.datetime.toKotlinLocalDate
 import java.time.LocalDate
 import kotlin.test.*
 
-// 顶层共享状态：object 不能带 @Volatile var，所以用一个顶层 @Volatile 变量。
-@Volatile
-private var lastCaptured: Args? = null
-
+/** 记录最近一次 [Ctx.args] 的探针 Check：用 `object` 自带字段存，测试之间不共享可变全局。 */
 private object ArgsCaptureCheck : CheckBase("args_capture") {
+    @Volatile
+    var captured: Args? = null
+
     override suspend fun Ctx.run() {
-        lastCaptured = args
+        captured = args
     }
 }
 
@@ -29,52 +25,40 @@ class CheckTest {
     @Test
     fun `runWith injects Args into Ctx before run`() {
         val args = Args(dt = "2026-09-20", params = mapOf("k" to "v"))
-        lastCaptured = null
+        ArgsCaptureCheck.captured = null
+
         runBlocking { ArgsCaptureCheck.runWith(args) }
-        assertEquals(args, lastCaptured)
+
+        assertEquals(args, ArgsCaptureCheck.captured)
     }
 
     @Test
     fun `registry register by name and lookup are reversible`() {
         val reg = CheckRegistry()
         reg.register("args_capture", ArgsCaptureCheck)
+
         assertSame(ArgsCaptureCheck, reg["args_capture"])
         assertEquals(listOf<Check>(ArgsCaptureCheck), reg.all())
     }
 
     @Test
-    fun `registry re-registering same name throws`() {
+    fun `registry re-registering the same name throws`() {
         val reg = CheckRegistry()
         reg.register("dup", ArgsCaptureCheck)
+
         assertFailsWith<IllegalStateException> { reg.register("dup", ArgsCaptureCheck) }
     }
 
     @Test
-    fun `registry reified register uses class simpleName as key`() {
-        val reg = CheckRegistry()
-        // The reified register<T>() exists on CheckRegistry but Kotlin overload resolution
-        // can pick the wrong overload when there's also register(name, check) member.
-        // Verify the simple form works via the explicit (name, instance) overload.
-        reg.register("ArgsCaptureCheck", ArgsCaptureCheck)
-        assertSame(ArgsCaptureCheck, reg["ArgsCaptureCheck"])
+    fun `registry operator get returns null for an unknown name`() {
+        assertEquals(null, CheckRegistry()["nope"])
     }
 
     @Test
-    fun `registry operator get returns null for unknown name`() {
-        val reg = CheckRegistry()
-        assertEquals(null, reg["nope"])
-    }
+    fun `Args defaults to today as an ISO date and no params`() {
+        val args = Args()
 
-    @Test
-    fun `Args defaults match contract`() {
-        val a = Args()
-        assertEquals(LocalDate.now().toKotlinLocalDate().format(Format {
-            year()
-            char('-')
-            monthNumber()
-            char('-')
-            day()
-        }), a.dt)
-        assertEquals(emptyMap(), a.params)
+        assertEquals(LocalDate.now(), LocalDate.parse(args.dt), "默认 dt 是今天的 ISO-8601 日期")
+        assertEquals(emptyMap(), args.params)
     }
 }

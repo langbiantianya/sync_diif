@@ -1,9 +1,7 @@
 package com.kxxnzstdsw.sync_diff.connectors
 
 import com.kxxnzstdsw.sync_diff.core.Connector
-import com.kxxnzstdsw.sync_diff.core.Row
-import com.kxxnzstdsw.sync_diff.core.guard
-import java.sql.DriverManager
+import java.sql.Connection
 
 /**
  * 可自定义的 DuckDB 连接器：用户可在 [setupSql] 中加载扩展、附加外部数据源（PostgreSQL /
@@ -16,72 +14,43 @@ import java.sql.DriverManager
  * - 其他 DuckDB 实例：`ATTACH 'duckdb:/tmp/db.duckdb' AS d (TYPE DUCKDB)`
  * - S3 / OSS：`CREATE SECRET` 后直接读写
  *
- * [setupSql] 在构造期执行，失败直接抛 `SQLException`（fail fast，与其他 Connector 一致）。
- * 连接生命周期：`autoCommit = false`，所有查询在同一个事务上下文内。
+ * 建会话 / 取数的公共实现见 [DuckDbSessionConnector]（`autoCommit=false`、
+ * `SET memory_limit` / `temp_directory`、[stream] 服务端游标逐行 `yield`）；本类不预加载任何
+ * 扩展，需要 httpfs / excel 就在 [setupSql] 里自己 `INSTALL` + `LOAD`。
+ *
+ * [setupSql] 在构造期执行（在 `SET memory_limit` / `SET temp_directory` 之后），失败直接抛
+ * `SQLException`（fail fast，与其他连接器一致）。
  *
  * ```kotlin
  * // 多数据源：对 DuckDB 附加的 PostgreSQL 和 MySQL 做跨源 join
  * DuckDBConnector { db ->
- *     // 附加 PostgreSQL
  *     db.createStatement().execute(
  *         "ATTACH 'postgresql://pg-host:5432/ods' AS pg (TYPE POSTGRESQL, USER 'etl', PASSWORD 'secret')"
  *     )
- *     // 附加 MySQL
  *     db.createStatement().execute(
  *         "ATTACH 'mysql://mysql-host:3306/ods' AS my (TYPE MYSQL, USER 'etl', PASSWORD 'secret')"
  *     )
- *     // 加载 httpfs 读 S3
- *     db.createStatement().execute("INSTALL httpfs; LOAD httpfs;")
+ *     db.createStatement().execute("INSTALL httpfs")
+ *     db.createStatement().execute("LOAD httpfs")
  * }.use { conn ->
- *     conn.query("""
+ *     conn.query(
+ *         """
  *         SELECT p.order_id, p.amount, m.status
  *         FROM pg.orders p
  *         JOIN my.orders m ON p.order_id = m.order_id
  *         WHERE p.dt = '2026-09-01'
- *     """)
+ *         """.trimIndent(),
+ *     )
  * }
  * ```
  *
  * 若不需要附加外部源，直接使用各专用连接器（`ParquetConnector` / `CsvConnector` 等）。
  */
 class DuckDBConnector(
-    private val setupSql: (java.sql.Connection) -> Unit = {},
-    private val memoryLimit: String = "4GB",
-    private val tempDir: String = "/tmp/duckdb_spill",
-) : Connector {
+    private val setupSql: (Connection) -> Unit = {},
+    memoryLimit: String = "4GB",
+    tempDir: String = "/tmp/duckdb_spill",
+) : DuckDbSessionConnector(memoryLimit, tempDir) {
 
-    private val conn = DriverManager.getConnection(JDBC_URL).apply {
-        autoCommit = false
-        createStatement().use { st ->
-            st.execute("SET memory_limit = '$memoryLimit'")
-            st.execute("SET temp_directory = '$tempDir'")
-        }
-        setupSql(this)
-    }
-
-    override fun query(sql: String): List<Row> = guard(sql) {
-        conn.prepareStatement(sql).use { st ->
-            st.executeQuery().use { rs -> rs.toRows() }
-        }
-    }
-
-    override fun stream(sql: String): Sequence<Row> = sequence {
-        guard(sql) {
-            conn.prepareStatement(sql).use { st ->
-                st.executeQuery().use { rs ->
-                    while (rs.next()) yield(rs.toRow())
-                }
-            }
-        }
-    }
-
-    override fun one(sql: String): Row? = query("$sql LIMIT 1").firstOrNull()
-
-    override fun close() {
-        conn.close()
-    }
-
-    private companion object {
-        private const val JDBC_URL = "jdbc:duckdb:"
-    }
+    override fun setup(conn: Connection) = setupSql(conn)
 }
