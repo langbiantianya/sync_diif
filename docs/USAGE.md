@@ -6,7 +6,7 @@
 - [1. 快速开始](#1-快速开始)
 - [2. 命令行](#2-命令行)
 - [3. 写自己的 Check](#3-写自己的-check)
-- [4. 三档 diff](#4-三档-diff)
+- [4. 三档 diff 与自定义档](#4-三档-diff-与自定义档)
 - [5. 字段规则 FieldRules](#5-字段规则-fieldrules)
 - [6. 新增一个上游数据源](#6-新增一个上游数据源)
 - [7. 报告与告警](#7-报告与告警)
@@ -308,15 +308,20 @@ object UserSyncCheck : CheckBase("user_sync") {
 
 ---
 
-## 4. 三档 diff
+## 4. 三档 diff 与自定义档
 
-`DiffEngine` 提供三档粒度，按代价从低到高排列，推荐「L1 不平就不必下钻 L3」：
+`DiffEngine` 提供三档粒度，外加一档「自己定口径」的自定义档；按代价从低到高排列，
+推荐「L1 不平就不必下钻 L3」：
 
 | 档 | 方法 | 输入 | 额外内存 | 用途 |
 |:--:|:---|:---|:---|:---|
 | L1 | `aggregate` | `List<Row>` | O(分区数) | count / sum / checksum 粗筛，一行一分区 |
 | L2 | `keySet` | `Sequence<Row>` | O(两端去重键数) | 找出只在单侧存在的主键 |
 | L3 | `compareRows` | `Sequence<Row>` | O(\|src\|) | 逐主键逐列细比 |
+| 自定义 | `reconcile` | `Sequence<Row>` | O(\|src\|) | 自己定「怎么算对得上」：多主键 / 归一键 / 自定义差异结构 |
+
+L1 / L3 / 自定义档建在同一个对齐内核 `align`（按 key 的全外连接）上，对齐、缺行、重复键
+的语义只有一份（见下面「内核约定」）；L2 是刻意例外（只需要主键、不需要行，省一个内存档次）。
 
 ### L1 聚合
 
@@ -342,6 +347,9 @@ val aggDiffs = diff.aggregate(srcAgg, tgtAgg, keys = listOf("dt")) {
 
 两侧都在时比较 `s.columns ∪ t.columns` 的全部列；只有一侧有时，按 `keys` 列 emit
 `FieldDiff.Missing`（整行缺失时只有主键是可比的）。
+
+行序与重复键走内核：**先 tgt 流序（命中与 tgt 独有交错）、再 src 独有**；同一主键 src 侧
+保留首次出现、tgt 侧逐条 emit（L1 的输入是 `GROUP BY` 结果，正常一个分区一行），见「内核约定」。
 
 ### L2 主键集合
 
@@ -381,7 +389,8 @@ diff.compareRows(
 - 先把 `src` 装成 `HashMap`（O(|src|) 内存），再流 `tgt`；`tgt` 可以任意大，
   `src` 必须装得下。两侧都可能很大时，先在 SQL 里采样（哈希桶 / `LIMIT` / 时间窗）。
 - 整行缺失时 emit `FieldDiff.Missing("<row>", Side.SRC/TGT)`，`"<row>"` 是占位字段名。
-- 重复主键保留**首次出现**。
+- 重复主键保留**首次出现**（tgt 侧不去重）、行序先 tgt 后 src 独有——这些是内核 `align` 的
+  约定，见「内核约定」。
 - 抽样下钻时 `LIMIT` 一定配 `ORDER BY`：只写 `LIMIT` 的话取哪几行由扫描顺序决定
   （多 part / 并行扫描下不稳定），两次运行会样到不同子集，报告结论不可回归。
 - `srcRowCount` / `tgtRowCount` / `rowDiffCount` 在流被消费时累加。
@@ -399,14 +408,65 @@ diff.compare(s, t) {
 }
 ```
 
+### 自定义档（reconcile）
+
+内置三档不够用时（多主键拼接、键要先归一、差异要写成自己的结构），不必改 `core`：
+对齐内核 `align` 是公开的，自定义档就是往里传一套 lambda。
+
+| lambda | 决定 |
+|:---|:---|
+| `key: (Row) -> K` | 怎么取对齐键。多列拼接、归一化（大小写 / 空格 / 前缀）都行，只要 `equals`/`hashCode` 是你要的语义 |
+| `compare: (Row, Row) -> V` | 两侧都有时产出什么。`V` 由你定义：自定义差异行、`Boolean`、一段文本都行 |
+| `onMissing: (K, Side) -> V` | 只有一侧时产出什么；`Side` 指向**缺的那一侧** |
+| `isDiff: (V) -> Boolean` | 产出物算不算一次差异。**必须显式给**：引擎不猜「缺行算不算差异」 |
+
+```kotlin
+/** 自定义差异行：(dt, order_id) 组合键，只比金额。 */
+data class AmountDiff(val key: String, val detail: String, val isDiff: Boolean)
+
+val diffs = diff.reconcile(
+    src = src.stream("SELECT dt, order_id, amount FROM read_parquet('...')"),
+    tgt = tgt.stream("SELECT dt, order_id, amount FROM ods.orders WHERE dt = '2026-09-20'"),
+    key = { row -> "${row["dt"]}/${row["order_id"]}" },        // 组合键，一行拼出来
+    onMissing = { k, side -> AmountDiff(k, "missing on $side", true) },
+    compare = { s, t ->
+        val sv = s["amount"] as BigDecimal
+        val tv = t["amount"] as BigDecimal
+        AmountDiff("${s["dt"]}/${s["order_id"]}", "amount $sv vs $tv", sv.compareTo(tv) != 0)
+    },
+    isDiff = { it.isDiff },
+).toList()      // ⚠ 必须消费，计数器才生效
+
+diff.summary()  // diffs 里的差异已经并进 diffCount / hasDiff
+```
+
+要点：
+
+- **对齐语义与内置档完全一致**（顺序、缺行、重复键、内存、惰性）：它们本来就是同一个
+  `align`，见下面「内核约定」。
+- **计数**：`src` / `tgt` 流过的每一行进 `srcRowCount` / `tgtRowCount`，每个 `isDiff` 为 true
+  的产出进 `customDiffCount`，并进 `summary().diffCount`——与内置档一样，**在流被消费时**累加。
+- **只看不计数**用 `align`：同一个内核，不碰任何计数器，也不预设「差异」这个概念，
+  可以用来做任何"按 key 把两侧对齐"的事。
+
+### 内核约定（align / compareRows / reconcile 共用）
+
+- **产出顺序**：先按 `tgt` 的流序（命中的与 tgt 独有的交错），再按 src 的首次出现顺序输出
+  src 独有的键。`aggregate` / `compareRows` / `reconcile` 的行序都是它——这个顺序让 `tgt`
+  单向流过、不落堆，只有 `src` 进 `HashMap`。
+- **缺行**：`Side` 指向**缺的那一侧**——tgt 独有 → `Side.SRC`，src 独有 → `Side.TGT`。
+- **重复键**：`src` 侧保留**首次出现**，后面的同键行丢弃；`tgt` 侧重复键**各自产出**
+  （同一个键会出现多次），要不要去重由调用方决定。
+- **惰性**：不消费序列就不读数据、不累加计数器（`align(...)` 这一句本身不读任何一侧）。
+
 ### 读结果
 
 `summary()` 把运行期计数器折叠成 `DiffSummary`：
 
 ```kotlin
 val summary = diff.summary()
-summary.srcCount    // 只有 compareRows 会计数；只跑 L1 时是 0
-summary.diffCount   // aggDiffCount + keyDiffCount + rowDiffCount（不去重）
+summary.srcCount    // 只有流式档（compareRows / reconcile）会累加；只跑 L1 时是 0
+summary.diffCount   // aggDiffCount + keyDiffCount + rowDiffCount + customDiffCount（不去重）
 summary.hasDiff     // diffCount > 0
 summary.level       // INFO / WARN
 ```
@@ -852,12 +912,13 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
 ./gradlew :checks:test         # 只跑 Check 层
 ```
 
-用例分布（共 95 个；`./gradlew test` 的 "tests completed" 计数）：
+用例分布（共 105 个；`./gradlew test` 的 "tests completed" 计数）：
 
 | 模块 | 用例文件 | 覆盖 |
 |:---|:---|:---|
-| `core`（77） | `core/src/test/kotlin/.../core/CoreTypesTest.kt`（27） | Row 扩展、FieldRules 两种写法、DiffSummary |
+| `core`（87） | `core/src/test/kotlin/.../core/CoreTypesTest.kt`（27） | Row 扩展、FieldRules 两种写法、DiffSummary |
 | | `.../engine/DiffEngineTest.kt`（17） | 三档 diff、计数器、`keySet` 去重与扫描次数 |
+| | `.../engine/DiffAlignTest.kt`（10） | `align` 内核（顺序 / 缺行侧 / 重复键 / 惰性 / 不碰计数器）与 `reconcile` 自定义档（计数进 summary） |
 | | `.../connectors/ParquetConnectorTest.kt`（5） | DuckDB 读写、类型归一、`guard` 契约 |
 | | `.../connectors/JdbcConnectorContractTest.kt`（5） | `JdbcConnector` 的取数语义与「失败必抛 `ConnectorError`」（含 `stream`），用内置 H2 当方言替身 |
 | | `.../connectors/MssqlTopOneTest.kt`（5） | `one()` 的 T-SQL 改写（`SELECT TOP 1`）与边界 |
@@ -919,3 +980,7 @@ ORDERS_TGT_PARQUET_PATH=/tmp/e2e_tgt.parquet \
    的脏行"看起来像"两端一致"。要容忍就在 SQL 里 `WHERE key IS NOT NULL` 或 `COALESCE` 归一。
 9. **抽样下钻的 `LIMIT` 必须配 `ORDER BY`**：只写 `LIMIT` 时取哪几行由扫描顺序决定，两次运行
    样到不同子集，结论不可回归。
+10. **`aggregate` / `compareRows` / `reconcile` 共用内核，行序与重复键规则一致**：先 `tgt` 流序
+    （命中与 tgt 独有交错）、再 src 独有；重复主键 src 侧保留首次出现、tgt 侧逐条产出。
+    `aggregate` 的输出行序因此由「先 src、再 tgt 独有」变为内核序——报告是给人看的表格，
+    按主键排序请在 SQL 里 `ORDER BY`（或对结果自行排序）。

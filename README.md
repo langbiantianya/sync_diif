@@ -13,6 +13,9 @@
   Parquet + Impala，再写一个 Check 想换源就直接 `IcebergRESTConnector(...)` / `PgConnector(...)`。
 - **上游按需**：遇到一个源接一个。阶段 1 先接 Parquet（用 DuckDB 读），后续 JDBC 源逐个补齐。
 - **新增源零侵入**：加一个实现 `Connector` 的类即可，Check 里直接用它，不动任何已有代码。
+- **新增档零侵入**：`DiffEngine` 的对齐内核（`align`，按 key 的全外连接）是公开的，自定义
+  对账档只是往里传一套 lambda（`reconcile`：取键、比什么、缺行产出什么、什么算差异），
+  对齐 / 缺行 / 重复键语义与内置档共用，差异自动进 `summary()`。
 - **代码即配置**：`Check` 对象直接写 SQL 与规则，不引入 Capabilities、PushdownPlanner 之类的元数据层。
 
 Parquet 作为起点的原因：自带完整 schema、row group 流式扫描、天然支持对象存储，跳过 JDBC 流式参数调优，先把 diff 核心跑通。自测 / CI 用 Parquet 当上下游替身也是同一理由——不必起 Impala。
@@ -72,7 +75,27 @@ class DiffEngine {
         tgt: Sequence<Row>,
         key: (Row) -> Any,
         check: (Row, Row) -> List<FieldDiff>
-    )
+    ): Sequence<Pair<Any, List<FieldDiff>>>
+
+    // 共用内核：按 key 的全外连接。aggregate / compareRows 与自定义档都建在它上面
+    fun <K : Any, V> align(
+        src: Sequence<Row>,
+        tgt: Sequence<Row>,
+        key: (Row) -> K,
+        onMissing: (K, Side) -> V,          // 只有一侧时的产出，Side 指向缺的那一侧
+        compare: (Row, Row) -> V            // 两侧都有时的产出
+    ): Sequence<Pair<K, V>>
+
+    // 自定义档：内核 + 计数（srcRowCount / tgtRowCount / customDiffCount），进 summary()
+    fun <K : Any, V> reconcile(
+        src: Sequence<Row>,
+        tgt: Sequence<Row>,
+        key: (Row) -> K,
+        onMissing: (K, Side) -> V,
+        compare: (Row, Row) -> V,
+        isDiff: (V) -> Boolean              // 产出物算不算一次差异，引擎不猜
+    ): Sequence<Pair<K, V>>
+
     fun summary(): DiffSummary
 }
 ```
@@ -88,6 +111,11 @@ engine.aggregate(srcAgg, tgtAgg, keys = listOf("dt")) {
 ```
 
 等价的中缀写法：`field("s") by tolerance(abs = 0.01)`。
+
+**对齐语义只有一份**：`aggregate`（L1）与 `compareRows`（L3）都是 `align` 套上各自的
+"产出什么、记哪个计数"，自定义档就是调用方自己传这套 lambda。想加一档对账（多主键拼接、
+归一化键、自定义差异行）不必改引擎，写一次 `reconcile` 即可，差异自动进 `summary()`。
+`keySet`（L2）是刻意的例外：它只需要主键、不需要行，挂到内核上会多占一个内存档次（见 §4.4）。
 
 ## 4. Kotlin 特性约定（写"Kotlin"，不写"带缩进的 Java"）
 
@@ -490,7 +518,7 @@ DuckDB 没有 `read_jsonl` 这个函数（实测 1.5.5.1 有 `read_json` / `read
 1 周。包含：
 
 - `ParquetConnector`（DuckDB）、`ImpalaConnector`（Hive JDBC）——上下游共用同一套接口
-- `DiffEngine`（L1 聚合 + L2 主键集合 + L3 行级）
+- `DiffEngine`（L1 聚合 + L2 主键集合 + L3 行级 + 共用内核 `align` / 自定义档 `reconcile`）
 - `FieldRules` DSL（内置规则 + 自定义扩展函数）
 - `Check` 抽象 + `CheckRegistry`（连接配置由 Check 自己持有，框架不做兜底）
 - `Reporter`（Excel + Webhook）
@@ -502,6 +530,7 @@ DuckDB 没有 `read_jsonl` 这个函数（实测 1.5.5.1 有 `read_json` / `read
 - Impala JDBC 连接稳定
 - L1/L2/L3 diff 结果正确
 - 自定义规则 lambda 可扩展
+- 自定义对账档（`reconcile`）能自己定口径，并把差异带进 `summary()`
 - 对象存储（S3/OSS）可读
 
 ## 6. 已实现的连接器
